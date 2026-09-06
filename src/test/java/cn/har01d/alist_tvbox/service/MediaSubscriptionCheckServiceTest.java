@@ -1372,6 +1372,93 @@ class MediaSubscriptionCheckServiceTest {
         assertFalse(MediaSubscriptionCheckService.shouldAutoEnd(subscription, 10));
     }
 
+    // ---------- 线上事故回归:官方已播 > 总集数的桥接污染(瑞克 S9,订阅 18) ----------
+    // B站 refineAiredCount 季盲匹配(基名「瑞克和莫蒂」命中 S1 条目)把 S1 口径的已播 11 取大
+    // 灌进总 10 的 S9 详情 → 落库不夹两头冒领:shouldReopen 把已完结订阅误判「官方集数上调」
+    // 重开(08-25 线上事件「10 → 11」),季播完完结路 collected>=officialEpisodes(11) 永不满足,
+    // ACTIVE 空转 12 天;「检查更新」也把污染值报成「本地缺第 11 集」假缺口。
+    // 总数是权威口径(computeMissing 的 base/详情页已播同规夹紧):快照落库时已播夹到总数。
+
+    @Test
+    void applyMetadataSnapshotClampsAiredEpisodesToTotal() throws Exception {
+        java.lang.reflect.Method snapshot = MediaSubscriptionCheckService.class
+                .getDeclaredMethod("applyMetadataSnapshot", MediaSubscription.class, MetadataDetails.class);
+        snapshot.setAccessible(true);
+
+        MetadataDetails polluted = new MetadataDetails();
+        polluted.setTotalEpisodes(10);
+        polluted.setAiredEpisodes(11);
+        MediaSubscription subscription = subscription();
+        snapshot.invoke(service, subscription, polluted);
+        assertEquals(10, subscription.getOfficialTotal());
+        assertEquals(10, subscription.getOfficialEpisodes(), "已播超总数 = 桥接污染,必须夹住");
+
+        // 总数未知:无从夹,照收(不能为夹紧造出总数)
+        MetadataDetails noTotal = new MetadataDetails();
+        noTotal.setAiredEpisodes(11);
+        MediaSubscription withoutTotal = subscription();
+        snapshot.invoke(service, withoutTotal, noTotal);
+        assertEquals(11, withoutTotal.getOfficialEpisodes());
+
+        // 已播 ≤ 总数:透传
+        MetadataDetails normal = new MetadataDetails();
+        normal.setTotalEpisodes(12);
+        normal.setAiredEpisodes(9);
+        MediaSubscription passthrough = subscription();
+        snapshot.invoke(service, passthrough, normal);
+        assertEquals(12, passthrough.getOfficialTotal());
+        assertEquals(9, passthrough.getOfficialEpisodes());
+    }
+
+    // ---------- 线上事故回归:官方已播滞后于资源现实的完结(师兄太稳健,订阅 44) ----------
+    // 全 30 集网盘资源已收齐(currentEpisodes=30=officialTotal),官方元数据已播停在 26、
+    // RETURNING、无下集排播 —— 四条既有完结路全灭(手填/剧级ENDED/季播完 aired≥total 均不满足),
+    // 订阅 ACTIVE 每 6h 空巡检。集齐全部登记集数且无下集排播 = 本季已无可追之物,应完结;
+    // 官方后续扩总数/已播上调由 reopenEnded 正常重开。
+
+    @Test
+    void collectedAllWithNoNextAirEndsDespiteAiredLag() {
+        MediaSubscription subscription = subscription();
+        subscription.setOfficialStatus(MetadataDetails.STATUS_RETURNING);
+        subscription.setOfficialEpisodes(26);
+        subscription.setOfficialTotal(30);
+        assertTrue(MediaSubscriptionCheckService.shouldAutoEnd(subscription, 30),
+                "集齐总数 + 官方无待播集:已播统计滞后不得阻止完结");
+        // 还有下集排播:官方登记未播完,不完结
+        subscription.setNextAirTime(System.currentTimeMillis() + 48 * 3600_000L);
+        assertFalse(MediaSubscriptionCheckService.shouldAutoEnd(subscription, 30));
+        // 未集齐:继续追缺
+        subscription.setNextAirTime(null);
+        assertFalse(MediaSubscriptionCheckService.shouldAutoEnd(subscription, 29));
+    }
+
+    @Test
+    void checkUpdateEndsSubscriptionWhenCollectedAll() {
+        // 「检查更新」轻查应直接落完结,不必等完整巡检(用户语义:点它就是来对齐状态的)
+        Fixture fixture = new Fixture();
+        fixture.subscription.setMetaProvider("douban");
+        fixture.subscription.setMetaId("36406417");
+        fixture.subscription.setOfficialEpisodes(26);
+        fixture.subscription.setOfficialTotal(30);
+        fixture.subscription.setOfficialStatus(MetadataDetails.STATUS_RETURNING);
+        MetadataDetails details = new MetadataDetails();
+        details.setTotalEpisodes(30);
+        details.setAiredEpisodes(26);
+        details.setStatus(MetadataDetails.STATUS_RETURNING);
+        Mockito.when(fixture.metadataService.refreshDetails(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenReturn(details);
+        Mockito.when(fixture.episodeSourceRepository.findNumbersBySubscriptionAndStatesIn(Mockito.eq(1), Mockito.anyCollection()))
+                .thenReturn(numbers(1, 30));
+
+        String message = fixture.service.checkUpdateNow(0, 1);
+
+        assertTrue(message.startsWith("已完结(共 30 集"), "检查更新应直接完结: " + message);
+        assertEquals(MediaSubscription.STATUS_ENDED, fixture.subscription.getStatus());
+        Mockito.verify(fixture.eventRepository).save(Mockito.argThat(e ->
+                e != null && MediaSubscriptionEvent.TYPE_ENDED.equals(e.getType())
+                        && e.getDetail().contains("检查更新")));
+    }
+
     // ---------- 退役/拒绝冷却重探 ----------
 
     @Test

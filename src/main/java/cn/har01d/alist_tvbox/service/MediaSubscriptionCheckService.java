@@ -1828,7 +1828,7 @@ public class MediaSubscriptionCheckService {
         return checkUpdateInternal(id);
     }
 
-    /** 轻量检查核心:刷新元数据 → 官方已播 vs 本地已有 → 结论进事件流并返回文本。 */
+    /** 轻量检查核心:刷新元数据 → 完结条件达标即落完结 → 官方已播 vs 本地已有 → 结论进事件流并返回文本。 */
     private String checkUpdateInternal(int id) {
         try {
             MediaSubscription current = subscriptionRepository.findById(id).orElse(null);
@@ -1850,11 +1850,28 @@ public class MediaSubscriptionCheckService {
             }
             subscriptionRepository.save(current);
 
-            int official = details.getAiredEpisodes() == null ? 0 : details.getAiredEpisodes();
+            // 轻查同样能落完结:快照刷新后完结条件即已客观成立(手填/播完/集齐总数),不必等
+            // 完整巡检 —— 「检查更新」的用户语义就是"对齐官方状态",巡检重(列目录/搜索/补缺)
+            // 而此处秒级(线上:师兄太稳健 30/30 收齐+官方已播滞后 26/30 卡 ACTIVE,点检查更新
+            // 即应完结)。PAUSED 是用户主动冻结,不做状态迁移
+            Set<Integer> local = liveEpisodeNumbers(current);
+            if (!MediaSubscription.STATUS_PAUSED.equals(current.getStatus())
+                    && shouldAutoEnd(current, local.size())
+                    && !MediaSubscription.STATUS_ENDED.equals(current.getStatus())) {
+                current.setStatus(MediaSubscription.STATUS_ENDED);
+                subscriptionRepository.save(current);
+                addEvent(id, MediaSubscriptionEvent.TYPE_ENDED,
+                        "已完结(共 " + local.size() + " 集)(检查更新)");
+                log.info("media subscription {} ended by update check: {} episodes", id, local.size());
+                return "已完结(共 " + local.size() + " 集)";
+            }
+
+            // 已播读上面 applyMetadataSnapshot 落好的夹紧快照:直读 details 会把桥接污染值
+            // (瑞克 S9 的已播 11 > 总数 10)报成"本地缺第 11 集"假缺口
+            int official = current.getOfficialEpisodes() == null ? 0 : current.getOfficialEpisodes();
             if (official <= 0) {
                 return event(id, "官方暂无已播集数信息(" + current.getMetaProvider() + "未提供)");
             }
-            Set<Integer> local = liveEpisodeNumbers(current);
             List<Integer> missing = new ArrayList<>();
             // 季起始集号下界:分季订阅对齐后季前旧集不在缺口口径(与 computeMissing 同规)
             int lower = current.getSeasonStartEpisode() != null && current.getSeasonStartEpisode() > 1
@@ -1893,11 +1910,17 @@ public class MediaSubscriptionCheckService {
         }
         // provider 降级只覆盖部分字段时不能把已知快照洗掉:官方集数门禁(集号范围/标题宣称)与
         // ENDED 重开判定都依赖这两个值,null(未知)保留旧值,非 null(含修正)照常更新
-        if (details.getAiredEpisodes() != null) {
-            subscription.setOfficialEpisodes(details.getAiredEpisodes());
-        }
         if (details.getTotalEpisodes() != null) {
             subscription.setOfficialTotal(clampTotalShrink(subscription, details.getTotalEpisodes()));
+        }
+        if (details.getAiredEpisodes() != null) {
+            // 官方已播超过总集数 = 上游桥接污染(瑞克 S9:TMDB 季错配把 S1 的已播 11 灌进总 10 的
+            // 条目):落库不夹会两头冒领 —— shouldReopen 把完结订阅误判"官方集数上调"重开,
+            // shouldAutoEnd 季播完路被超界已播卡死永不复完。总数是权威口径(clampTotalShrink/
+            // 缺集 base/详情页已播夹紧同规):已播夹到总数,上游修正总数后自然放开
+            int aired = details.getAiredEpisodes();
+            Integer total = subscription.getOfficialTotal();
+            subscription.setOfficialEpisodes(total != null && total > 0 && aired > total ? total : aired);
         }
         subscription.setOfficialStatus(details.getStatus());
         subscription.setNextAirTime(details.getNextAirTime());
@@ -6255,9 +6278,11 @@ public class MediaSubscriptionCheckService {
     }
 
     /**
-     * 自动完结:手填期望达标 / 官方剧级 ENDED 且集齐 / 本季已播完且集齐。
+     * 自动完结:手填期望达标 / 官方剧级 ENDED 且集齐 / 本季已播完且集齐 / 集齐全部登记集数且无下集排播。
      * 第三条是多季剧专用 —— 剧级 status 恒 RETURNING(还有下一季),本季播完要看季口径
      * (已播 ≥ 总集数且无下集播出时间),否则瑞克和莫蒂这类续订剧的季订阅永远停在 ACTIVE 空巡检。
+     * 第四条治官方已播统计滞后:全季网盘资源已收齐而元数据已播停在 26/30 时 aired≥total 永不
+     * 满足,但本季实际已无可追之物 —— 无下集排播 + 集齐总数即完结,官方扩总数走重开回 ACTIVE。
      */
     static boolean shouldAutoEnd(MediaSubscription subscription, int collected) {
         Integer expected = subscription.getExpectedEpisodes();
@@ -6270,7 +6295,9 @@ public class MediaSubscriptionCheckService {
                 && collected >= subscription.getOfficialEpisodes();
         boolean endedBySeasonAired = subscription.isSeasonAiredOut()
                 && collected >= subscription.getOfficialEpisodes();
-        return endedByExpected || endedByManual || endedByOfficial || endedBySeasonAired;
+        int total = subscription.effectiveTotalEpisodes();
+        boolean endedByCollectedAll = total > 0 && collected >= total && subscription.getNextAirTime() == null;
+        return endedByExpected || endedByManual || endedByOfficial || endedBySeasonAired || endedByCollectedAll;
     }
 
     // ---------- 候选池与打分 ----------
