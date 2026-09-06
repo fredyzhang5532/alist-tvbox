@@ -89,7 +89,16 @@ public class MediaLibraryController {
 
     private static boolean isPianDanId(String value) {
         return value != null && (value.startsWith(PianDanService.DOUBAN_PREFIX) || value.startsWith(PianDanService.TMDB_PREFIX)
-                || value.startsWith("s:"));
+                || value.startsWith(PianDanService.DOUBAN_SUBJECT_PREFIX) || value.startsWith("s:"));
+    }
+
+    /** db:{纯数字} → 豆瓣 subject id;格式非法 400(与 tmdb 分支同口径)。 */
+    private static int parseDoubanSubjectId(String id) {
+        try {
+            return Integer.parseInt(id.substring(PianDanService.DOUBAN_SUBJECT_PREFIX.length()));
+        } catch (NumberFormatException e) {
+            throw new BadRequestException("无效的片单条目: " + id);
+        }
     }
 
     private Object detail(int uid, String id, String ac, String title) {
@@ -183,8 +192,19 @@ public class MediaLibraryController {
             if (detail == null) {
                 throw new BadRequestException("片单条目信息获取失败: " + id);
             }
+        } else if (id.startsWith(PianDanService.DOUBAN_SUBJECT_PREFIX)) {
+            // db:{豆瓣id}:本地库 id 直取,未收录的榜单新片回落 rexxar 在线解析(命中短缓存实例,拷贝防污染)
+            int doubanId = parseDoubanSubjectId(id);
+            detail = mediaSubscriptionService.localDoubanDetailById(doubanId);
+            if (detail == null) {
+                detail = copyDetail(pianDanService.doubanSubjectDetail(doubanId));
+            }
+            if (detail == null) {
+                throw new BadRequestException("片单条目信息获取失败: " + id);
+            }
+            detail.setVod_id(id);
         } else if (id.startsWith("s:")) {
-            // 豆瓣片单条目无 subject id:名称(+vod_id 内嵌年份)在本地豆瓣库严格唯一匹配,命中返回富详情
+            // 豆瓣片单条目无 subject id 的兜底形态:名称(+vod_id 内嵌年份)在本地豆瓣库严格唯一匹配,命中返回富详情
             PianDanService.NameYear entry = PianDanService.parseSubjectId(id);
             detail = mediaSubscriptionService.localDoubanDetail(entry.name(), entry.year());
             if (detail == null) {

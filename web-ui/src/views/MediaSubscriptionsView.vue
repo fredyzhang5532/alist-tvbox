@@ -937,7 +937,7 @@
       </div>
     </el-dialog>
 
-    <el-dialog v-model="navDetailVisible" title="媒体详情" width="680">
+    <el-dialog v-model="navDetailVisible" title="媒体详情" width="860">
       <div class="nav-detail" v-loading="navDetailLoading">
         <template v-if="navDetail">
           <el-image :src="navDetailPoster" fit="cover" class="nav-detail-poster">
@@ -951,9 +951,9 @@
               <span v-if="navDetail.vod_year" class="sub-text">({{ navDetail.vod_year }})</span>
             </div>
             <div class="nav-detail-tags">
-              <el-tag v-for="genre in navDetailGenres" :key="genre" size="small" effect="plain">{{ genre }}</el-tag>
-              <el-tag v-if="navDetail.vod_remarks" size="small" type="warning">{{ navDetail.vod_remarks }}</el-tag>
-              <el-tag v-for="season in navDetailSeasons" :key="'s' + season" size="small" type="info">第{{ season }}季</el-tag>
+              <el-tag v-for="genre in navDetailGenres" :key="genre" effect="plain">{{ genre }}</el-tag>
+              <el-tag v-if="navDetail.vod_remarks" type="warning">{{ navDetail.vod_remarks }}</el-tag>
+              <el-tag v-for="season in navDetailSeasons" :key="'s' + season" type="info">第{{ season }}季</el-tag>
             </div>
             <div v-if="navDetail.vod_director" class="sub-text">导演:{{ navDetail.vod_director }}</div>
             <div v-if="navDetail.vod_actor" class="sub-text">演员:{{ navDetail.vod_actor }}</div>
@@ -3184,12 +3184,12 @@ const formatClock = (time: number) => {
 
 .nav-detail {
   display: flex;
-  gap: 18px;
-  min-height: 260px;
+  gap: 24px;
+  min-height: 300px;
 }
 
 .nav-detail-poster {
-  width: 180px;
+  width: 220px;
   aspect-ratio: 2 / 3;
   flex-shrink: 0;
   border-radius: 6px;
@@ -3202,11 +3202,16 @@ const formatClock = (time: number) => {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 8px;
+  gap: 10px;
+}
+
+.nav-detail-info .sub-text {
+  font-size: 15px;
+  line-height: 1.6;
 }
 
 .nav-detail-title {
-  font-size: 18px;
+  font-size: 22px;
   font-weight: 600;
   line-height: 1.4;
 }
@@ -3214,12 +3219,12 @@ const formatClock = (time: number) => {
 .nav-detail-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
 }
 
 .nav-detail-overview {
-  font-size: 13px;
-  line-height: 1.7;
+  font-size: 15px;
+  line-height: 1.8;
   white-space: pre-wrap;
 }
 
