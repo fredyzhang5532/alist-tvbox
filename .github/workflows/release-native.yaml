@@ -301,7 +301,11 @@ jobs:
             docker push "$TARGET_IMAGE"
           done
 
-      - name: Send general notification
+  upload-artifcat:
+    needs: tag-latest-native
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send download notification
         env:
           api: ${{ secrets.NOTIFY_API }}
         if: ${{ env.api != '' }}
