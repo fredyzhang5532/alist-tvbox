@@ -12,6 +12,7 @@ import cn.har01d.alist_tvbox.entity.HistoryRepository;
 import cn.har01d.alist_tvbox.entity.IndexTemplateRepository;
 import cn.har01d.alist_tvbox.entity.MediaSubscription;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisode;
+import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeFallbackRepository;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeRepository;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeSource;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeSourceRepository;
@@ -4385,6 +4386,31 @@ class MediaSubscriptionCheckServiceTest {
     }
 
     @Test
+    void resetInventoryForSeasonClearsFallbackOverlay() {
+        // 覆盖层行只按 (subscription, episode) 键、无季列:换季重置不连带清,
+        // 旧季直链会在新季首轮搜索前经播放兜底冒领集号
+        MediaSubscriptionResourceRepository resourceRepository = Mockito.mock(MediaSubscriptionResourceRepository.class);
+        MediaSubscriptionEventRepository eventRepository = Mockito.mock(MediaSubscriptionEventRepository.class);
+        MediaSubscriptionEpisodeRepository episodeRepository = Mockito.mock(MediaSubscriptionEpisodeRepository.class);
+        MediaSubscriptionEpisodeSourceRepository episodeSourceRepository = Mockito.mock(MediaSubscriptionEpisodeSourceRepository.class);
+        MediaSubscriptionEpisodeFallbackRepository fallbackRepository = Mockito.mock(MediaSubscriptionEpisodeFallbackRepository.class);
+        MediaSubscriptionCheckService svc = new MediaSubscriptionCheckService(
+                null, resourceRepository, eventRepository, episodeRepository, episodeSourceRepository, null, null, null,
+                null, null, null, null, null, null, null, null,
+                null, null, null, null, null, null, null, null,
+                null, null, appProperties, new ObjectMapper(), null, null, null, null,
+                fallbackRepository
+                );
+        MediaSubscription subscription = new MediaSubscription();
+        subscription.setId(9);
+        Mockito.when(resourceRepository.findBySubscriptionIdOrderByScoreDesc(9)).thenReturn(List.of());
+
+        svc.resetInventoryForSeason(subscription, 3);
+
+        Mockito.verify(fallbackRepository).deleteBySubscriptionId(9);
+    }
+
+    @Test
     void purgeForeignSeasonResourcesSkipsWhenSeasonUnknown() {
         Fixture fixture = new Fixture();
         fixture.subscription.setName("末日地堡");
@@ -5349,6 +5375,55 @@ class MediaSubscriptionCheckServiceTest {
 
         assertEquals(0, probed.get(), "未上架的集无行可探");
         Mockito.verifyNoInteractions(fixture.eventRepository);
+    }
+
+    @Test
+    void preheatAheadMissingEpisodeInWindowTriggersRescue() {
+        Fixture fixture = new Fixture();
+        RowStore store = new RowStore();
+        installMountedResource(fixture, store);
+        AtomicInteger probed = new AtomicInteger();
+        fixture.service.setStreamProbeClient((url, userAgent, maxBytes, timeoutSeconds) -> {
+            probed.incrementAndGet();
+            return new StreamProbeClient.ProbeResult(206, "video/mp4", new byte[]{0x1A, 0x45});
+        });
+        Mockito.when(fixture.aListService.getFile(Mockito.any(), Mockito.anyString())).thenReturn(rawUrlDetail());
+        // 第 4、6 集有行,第 5 集从未上架(线上:海贼王 837 集无任何源)—— 探测循环看不见它
+        store.addEpisodeAndRow(7, 4, MediaSubscriptionEpisodeSource.STATE_LISTED);
+        store.addEpisodeAndRow(7, 6, MediaSubscriptionEpisodeSource.STATE_LISTED);
+
+        fixture.service.preheatAhead(fixture.subscription, 3);
+
+        assertEquals(2, probed.get(), "只探测已有行的 4、6 两集");
+        ArgumentCaptor<MediaSubscriptionEvent> events = ArgumentCaptor.forClass(MediaSubscriptionEvent.class);
+        Mockito.verify(fixture.eventRepository, Mockito.atLeastOnce()).save(events.capture());
+        MediaSubscriptionEvent event = events.getAllValues().stream()
+                .filter(e -> e.getDetail().contains("缺集"))
+                .findFirst().orElseThrow(() -> new AssertionError("应写缺集补源事件,实际:" + events.getAllValues()));
+        assertEquals(MediaSubscriptionEvent.TYPE_GAP_FILLED, event.getType());
+        assertTrue(event.getDetail().contains("第5 集缺集"), event.getDetail());
+        // 播放上下文自愈不外发通知:notificationService 未注入,事件只落时间线(push=false 由实现保证)
+    }
+
+    @Test
+    void preheatAheadMissingRescueHonoursCooldown() {
+        Fixture fixture = new Fixture();
+        RowStore store = new RowStore();
+        installMountedResource(fixture, store);
+        fixture.service.setStreamProbeClient((url, userAgent, maxBytes, timeoutSeconds) ->
+                new StreamProbeClient.ProbeResult(206, "video/mp4", new byte[]{0x1A, 0x45}));
+        Mockito.when(fixture.aListService.getFile(Mockito.any(), Mockito.anyString())).thenReturn(rawUrlDetail());
+        store.addEpisodeAndRow(7, 4, MediaSubscriptionEpisodeSource.STATE_LISTED);
+        store.addEpisodeAndRow(7, 6, MediaSubscriptionEpisodeSource.STATE_LISTED);
+
+        fixture.service.preheatAhead(fixture.subscription, 3);
+        fixture.service.preheatAhead(fixture.subscription, 3); // 2h 冷却内:洞还在也不重复触发
+
+        // 只数缺集事件(首次 submitCheck 的后台巡检可能并发写别的事件,不参与断言)
+        ArgumentCaptor<MediaSubscriptionEvent> events = ArgumentCaptor.forClass(MediaSubscriptionEvent.class);
+        Mockito.verify(fixture.eventRepository, Mockito.atLeastOnce()).save(events.capture());
+        assertEquals(1, events.getAllValues().stream().filter(e -> e.getDetail().contains("缺集")).count(),
+                "冷却窗口内缺集事件只写一次");
     }
 
     /** 挂载资源 + RowStore 内存库 + playCandidates 依赖的 findBySubscriptionAndNumber 派生查询。 */
