@@ -2801,9 +2801,12 @@ class MediaSubscriptionCheckServiceTest {
     @Test
     void playCandidatesPreferVerifiedRowOverHigherScoredListed() {
         Fixture fixture = new Fixture();
+        // 两行都挂补缺路径:主源不参与,验证非主源之间 VERIFIED > 分数
         MediaSubscriptionResource listed = mountedPrimary(3, 9);
+        listed.setMountPath("/追剧/.sources/1-测试剧-补1");
         listed.setScore(90);
         MediaSubscriptionResource verified = mountedPrimary(4, 10);
+        verified.setMountPath("/追剧/.sources/1-测试剧-补2");
         verified.setScore(10);
         MediaSubscriptionEpisodeSource listedRow = sourceRow(21, 100, 3, MediaSubscriptionEpisodeSource.STATE_LISTED, "第17集.mkv");
         MediaSubscriptionEpisodeSource verifiedRow = sourceRow(22, 100, 4, MediaSubscriptionEpisodeSource.STATE_VERIFIED, "第17集.mkv");
@@ -2816,6 +2819,30 @@ class MediaSubscriptionCheckServiceTest {
 
         assertEquals(2, candidates.size());
         assertEquals(4, candidates.getFirst().resource().getId(), "VERIFIED 行先于高分 LISTED 行");
+    }
+
+    /** 线上(醒来 sub67):主源换百度后,UC 补缺行凭旧播放留下的 VERIFIED 仍压主源行,
+     *  UC 代理又连不通——用户重试 20 次全打同一个 UC pid。「转主源」后主源资源的行必须恒居前。 */
+    @Test
+    void playCandidatesRankPrimaryResourceAheadOfVerifiedAux() {
+        Fixture fixture = new Fixture();
+        MediaSubscriptionResource primary = mountedPrimary(3, 9); // 主源路径 /追剧/1-测试剧
+        primary.setScore(60);
+        MediaSubscriptionResource auxVerified = mountedPrimary(4, 10);
+        auxVerified.setMountPath("/追剧/.sources/1-测试剧-补2");
+        auxVerified.setScore(100);
+        MediaSubscriptionEpisodeSource primaryRow = sourceRow(21, 100, 3, MediaSubscriptionEpisodeSource.STATE_LISTED, "第17集.mkv");
+        MediaSubscriptionEpisodeSource verifiedRow = sourceRow(22, 100, 4, MediaSubscriptionEpisodeSource.STATE_VERIFIED, "第17集.mkv");
+        Mockito.when(fixture.resourceRepository.findBySubscriptionIdOrderByScoreDesc(1))
+                .thenReturn(List.of(auxVerified, primary)); // 高分 VERIFIED 补缺行在列表更前也不得压主源
+        Mockito.when(fixture.episodeSourceRepository.findBySubscriptionAndNumber(1, 17))
+                .thenReturn(List.of(verifiedRow, primaryRow));
+
+        List<MediaSubscriptionCheckService.PlayCandidate> candidates = fixture.service.playCandidates(fixture.subscription, 17);
+
+        assertEquals(2, candidates.size());
+        assertEquals(3, candidates.getFirst().resource().getId(), "主源资源的行恒居前,VERIFIED 补缺行让位");
+        assertEquals(4, candidates.get(1).resource().getId(), "主源之后仍按 VERIFIED>LISTED 排");
     }
 
     @Test

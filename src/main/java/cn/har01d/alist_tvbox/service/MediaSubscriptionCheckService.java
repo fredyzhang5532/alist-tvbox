@@ -3633,17 +3633,27 @@ public class MediaSubscriptionCheckService {
     }
 
     /** 某集的可播候选(集源行索引直查,不再逐挂载点递归列目录):
-     * LIVE 行 × MOUNTED 资源,按 VERIFIED>LISTED、资源分降序、成功率降序、失败率升序。 */
+     * LIVE 行 × MOUNTED 资源,主源资源的行恒居前(「转主源」即期望播放改走主源,线上:主源换百度后
+     * UC 补缺行凭旧 VERIFIED 仍压主源,UC 代理又连不通,用户重试 20 次全打同一个死 pid),
+     * 其余按 VERIFIED>LISTED、资源分降序、成功率降序、失败率升序。 */
     public List<PlayCandidate> playCandidates(MediaSubscription subscription, int episode) {
+        List<MediaSubscriptionResource> mountedList = mountedResources(subscription);
         Map<Integer, MediaSubscriptionResource> mounted = new HashMap<>();
-        for (MediaSubscriptionResource resource : mountedResources(subscription)) {
+        String mountPath = subscription.getMountPath();
+        Integer primaryId = null;
+        for (MediaSubscriptionResource resource : mountedList) {
             mounted.put(resource.getId(), resource);
+            if (primaryId == null && mountPath != null && mountPath.equals(resource.getMountPath())) {
+                primaryId = resource.getId();
+            }
         }
+        Integer primary = primaryId;
         return episodeSourceRepository.findBySubscriptionAndNumber(subscription.getId(), episode).stream()
                 .filter(row -> LIVE_STATES.contains(row.getState()))
                 .filter(row -> mounted.containsKey(row.getResourceId()))
                 .map(row -> new PlayCandidate(mounted.get(row.getResourceId()), row))
-                .sorted(Comparator.comparing(PlayCandidate::source, SOURCE_ORDER)
+                .sorted(Comparator.comparing((PlayCandidate c) -> primary != null && primary.equals(c.resource().getId()) ? 0 : 1)
+                        .thenComparing(PlayCandidate::source, SOURCE_ORDER)
                         .thenComparing(c -> -(c.resource().getScore() == null ? 0 : c.resource().getScore()))
                         .thenComparing(c -> TextUtils.picturePenalty(c.source().getRelPath()))) // 同分优先非 DV 版,防绿屏
                 .toList();
