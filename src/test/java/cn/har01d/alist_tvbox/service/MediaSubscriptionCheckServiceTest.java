@@ -5398,6 +5398,44 @@ class MediaSubscriptionCheckServiceTest {
         assertEquals(MediaSubscriptionResource.STATE_CANDIDATE, tomb.getState());
     }
 
+    @Test
+    void restoreResourceRevivesRetiredCandidate() {
+        Fixture fixture = new Fixture();
+        MediaSubscriptionResource retired = new MediaSubscriptionResource();
+        retired.setId(84);
+        retired.setSubscriptionId(1);
+        retired.setState(MediaSubscriptionResource.STATE_RETIRED);
+        retired.setFailKind(MediaSubscriptionResource.FAIL_KIND_DEAD);
+        retired.setMountPath("/追剧/.sources/旧挂载");
+        retired.setShareId(900);
+        retired.setCheckedTime(System.currentTimeMillis());
+        Mockito.when(fixture.resourceRepository.findById(84)).thenReturn(Optional.of(retired));
+
+        fixture.service.restoreResource(0, 1, 84);
+
+        assertEquals(MediaSubscriptionResource.STATE_CANDIDATE, retired.getState());
+        assertNull(retired.getFailKind(), "退役分类须清空,回初生候选形态");
+        assertNull(retired.getMountPath());
+        assertNull(retired.getShareId());
+        assertNull(retired.getCheckedTime(), "清检测时间,下轮巡检立即可探测");
+    }
+
+    @Test
+    void restoreResourceIgnoresMountedResource() {
+        Fixture fixture = new Fixture();
+        MediaSubscriptionResource mounted = new MediaSubscriptionResource();
+        mounted.setId(85);
+        mounted.setSubscriptionId(1);
+        mounted.setState(MediaSubscriptionResource.STATE_MOUNTED);
+        mounted.setMountPath("/追剧/.sources/补缺");
+        Mockito.when(fixture.resourceRepository.findById(85)).thenReturn(Optional.of(mounted));
+
+        fixture.service.restoreResource(0, 1, 85);
+
+        assertEquals(MediaSubscriptionResource.STATE_MOUNTED, mounted.getState(), "已挂载无需恢复,幂等返回");
+        assertEquals("/追剧/.sources/补缺", mounted.getMountPath());
+    }
+
     private static Set<Integer> episodeRange(int from, int to) {
         Set<Integer> numbers = new TreeSet<>();
         for (int i = from; i <= to; i++) {

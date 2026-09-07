@@ -645,6 +645,7 @@ public class MediaSubscriptionService {
                     && subscription.getMountPath() != null && subscription.getMountPath().equals(r.getMountPath()));
             dto.setPinned(Boolean.TRUE.equals(r.getPinned()));
             dto.setStartEpisode(r.getStartEpisode());
+            dto.setFailKind(r.getFailKind());
             dto.setCheckedTime(r.getCheckedTime());
             dto.setCreatedTime(r.getCreatedTime());
             return dto;
