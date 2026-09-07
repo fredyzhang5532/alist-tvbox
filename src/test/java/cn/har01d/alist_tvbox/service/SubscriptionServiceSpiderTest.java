@@ -120,6 +120,7 @@ class SubscriptionServiceSpiderTest {
 
     @Test
     void webHomeSiteInjectedOnlyForCapableClient() {
+        // 能力端(webhtv/fish):注入 homePage 站点,原生 WebHome 直接加载网页
         WebHomeService capable = mock(WebHomeService.class);
         when(capable.isCapable(anyString())).thenReturn(true);
         SubscriptionService service = newService("{}", capable);
@@ -127,13 +128,12 @@ class SubscriptionServiceSpiderTest {
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
         assertEquals("atv_home", sites.get(0).get("key"));
         assertEquals("csp_Builtin", sites.get(0).get("api"));
-        assertEquals("http://atv.example/webhome/app.html?token=-&v=10", sites.get(0).get("homePage"));
+        assertEquals("http://atv.example/webhome/app.html?token=-&v=14", sites.get(0).get("homePage"));
 
-        // 原版 FongMi 等不支持端:mock 默认 false,不注入
+        // 原版 FongMi/OK影视等普通端:不注入
         SubscriptionService plain = newService("{}");
         Map<String, Object> config2 = plain.subscription("", "http://up.example/config.json", "", null);
-        List<Map<String, Object>> sites2 = (List<Map<String, Object>>) config2.get("sites");
-        for (Map<String, Object> site : sites2) {
+        for (Map<String, Object> site : (List<Map<String, Object>>) config2.get("sites")) {
             assertEquals(false, "atv_home".equals(site.get("key")));
         }
     }

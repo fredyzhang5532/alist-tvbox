@@ -96,17 +96,31 @@
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .badge-rating {
-    position: absolute; left: 6px; bottom: 6px; z-index: 2;
+    position: absolute; right: 6px; bottom: 34px; z-index: 2;
     padding: 2px 8px; border-radius: 4px;
     background: rgba(10,14,24,0.78); color: #7fd48f; font-size: 12px;
     white-space: nowrap;
   }
-  .card .name {
-    margin-top: 8px; font-size: 14px; line-height: 1.35; height: 2.7em;
-    overflow: hidden; color: #d7dfeb;
+  /* 海报底部渐变信息条:标题+副行(参考 tmdb.html vod-info) */
+  .poster .info {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
+    padding: 26px 8px 7px 8px;
+    background: linear-gradient(180deg, rgba(8,11,18,0) 0%, rgba(8,11,18,0.88) 60%);
   }
-  .card:hover .poster, .card.focus .poster { border-color: #4f8cff; box-shadow: 0 0 0 3px rgba(79,140,255,0.35); }
-  .card:hover .name, .card.focus .name { color: #fff; }
+  .poster .info .t {
+    font-size: 13px; font-weight: 700; color: #fff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .poster .info .s {
+    margin-top: 2px; font-size: 11px; color: rgba(255,255,255,0.72);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* 焦点视觉:描边+光晕+微缩放(参考 tmdb.html focus scale) */
+  .card { transition: transform 0.15s; }
+  .card:hover .poster, .card.focus .poster {
+    border-color: #4f8cff; box-shadow: 0 0 0 3px rgba(79,140,255,0.55), 0 8px 22px rgba(0,0,0,0.55);
+  }
+  .card:hover, .card.focus { transform: scale(1.03); z-index: 5; }
 
   .detail-page {
     display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 50;
@@ -140,15 +154,15 @@
     max-height: 200px; overflow-y: auto;
   }
   .detail-actions { display: flex; }
+  /* 三个动作按钮统一样式(等高同底),仅焦点态高亮 —— 避免主次底色差异造成的"大小不一"观感 */
   .detail-actions .act {
-    flex: 0 0 auto; margin-right: 14px; height: 44px; padding: 0 22px;
-    border: none; border-radius: 22px; background: #2c4a8f; color: #fff;
-    font-size: 15px; cursor: pointer; outline: none;
+    flex: 0 0 auto; margin-right: 14px; height: 44px; line-height: 44px; padding: 0 22px;
+    border: 1px solid #2a3354; border-radius: 22px; background: rgba(255,255,255,0.08);
+    color: #e8ecf3; font-size: 15px; cursor: pointer; outline: none;
     -webkit-tap-highlight-color: rgba(0,0,0,0);
   }
-  .detail-actions .act.secondary { background: rgba(255,255,255,0.08); color: #c6d1e4; }
   .detail-actions .act:hover, .detail-actions .act:focus, .detail-actions .act.focus {
-    background: #4f8cff; color: #fff; outline: none;
+    background: #4f8cff; border-color: #4f8cff; color: #fff; outline: none;
   }
 
   .state { padding: 18px 42px; color: #7d8ba6; font-size: 14px; }
@@ -209,9 +223,9 @@
       <div class="detail-people" id="detail-people"></div>
       <div class="detail-desc" id="detail-desc"></div>
       <div class="detail-actions">
-        <button class="act" id="detail-search" type="button">🔍 搜索播放</button>
-        <button class="act secondary" id="detail-sub" type="button">➕ 加入追剧</button>
-        <button class="act secondary" id="detail-close" type="button">关闭</button>
+        <button class="act" id="detail-search" type="button">搜索播放</button>
+        <button class="act" id="detail-sub" type="button">➕ 加入追剧</button>
+        <button class="act" id="detail-close" type="button">关闭</button>
       </div>
     </div>
   </div>
@@ -272,12 +286,21 @@
   /* ---------- 环境与 SDK ---------- */
   var native = !!window.fongmiBridge || (window.fongmiClient != null);
   var fm = null;      // fmsdk 事件后可用
+  /* SERVER:WebHome 原生场景=页面所在 origin;JJ-html 等本地加载器场景页面在 127.0.0.1:2026,
+   * 由 /webhome/jj.html 下载端点在文件头注入 window.ATV_SERVER/ATV_TOKEN(或 ?server= 参数) */
+  var SERVER = location.origin;
+  try {
+    var sm = location.search.match(/[?&]server=([^&]*)/);
+    if (sm) SERVER = decodeURIComponent(sm[1].replace(/\/+$/, ''));
+  } catch (e) { }
+  if (window.ATV_SERVER) SERVER = String(window.ATV_SERVER).replace(/\/+$/, '');
   var token = '';
   try {
     var m = location.search.match(/[?&]token=([^&]*)/);
     if (m) token = decodeURIComponent(m[1].replace(/\+/g, '%20'));
   } catch (e) { token = ''; }
-  var API_BASE = location.origin + '/media' + (token && token !== '-' ? '/' + encodeURIComponent(token) : '');
+  if (!token && window.ATV_TOKEN) token = String(window.ATV_TOKEN);
+  var API_BASE = SERVER + '/media' + (token && token !== '-' ? '/' + encodeURIComponent(token) : '');
 
   function getJson(url) {
     if (fm && fm.req) {
@@ -350,10 +373,11 @@
     }
   }
 
-  /** 封面地址:同源相对路径直用;外站绝对地址走 fm.res 本地网关(异常回落原始地址)。 */
+  /** 封面地址:本服务相对路径(/images 代理)补全 SERVER 绝对地址(JJ-html 场景页面不在服务端域);
+   *  外站绝对地址走 fm.res 本地网关(异常回落原始地址)。 */
   function coverSrc(pic) {
     if (!pic) return pic;
-    if (pic.indexOf('/') === 0) return pic;
+    if (pic.indexOf('/') === 0) return SERVER + pic;
     if (pic.indexOf('http') === 0 && fm && fm.res) {
       try { return fm.res(pic); } catch (e) { return pic; }
     }
@@ -391,16 +415,48 @@
       /* 同源相对地址(本服务 /images 代理)直连;外站绝对地址按文档走 fm.res 本地网关,
        * fm.res 对非 http 形态可能抛错,兜底回落原始地址 */
       img.src = coverSrc(pic);
+      img.loading = 'lazy'; /* 原生懒加载,长列表省流量 */
       poster.appendChild(img);
     }
     var ph = el('div', 'ph', name || '—');
     poster.appendChild(ph);
+    /* 海报底部渐变信息条:标题 + 副行(备注/年份);顶部角标保留进度 */
+    var info = el('div', 'info');
+    info.appendChild(el('div', 't', name || '—'));
+    if (remark) info.appendChild(el('div', 's', remark));
+    poster.appendChild(info);
     card.appendChild(poster);
-    card.appendChild(el('div', 'name', name));
     var run = function () {
       if (action) action(item, card);
     };
     card.onclick = run;
+    /* 长按 700ms = 全局搜索该剧(参考 tmdb.html bindRemotePress) */
+    var pressTimer = null;
+    card.onkeydown = function (ev) {
+      if (ev.key === 'Enter' || ev.keyCode === 23 || ev.keyCode === 13) {
+        if (pressTimer == null) {
+          pressTimer = setTimeout(function () {
+            pressTimer = 'fired';
+            doSearch(name);
+          }, 700);
+        }
+        ev.stopPropagation();
+      }
+    };
+    card.onkeyup = function (ev) {
+      if (ev.key === 'Enter' || ev.keyCode === 23 || ev.keyCode === 13) {
+        if (pressTimer === 'fired') {
+          card.onclick = function () { };  /* 长按后的合成 click 压制 */
+          setTimeout(function () { card.onclick = run; }, 300);
+          ev.preventDefault();
+          ev.stopPropagation();
+        } else if (pressTimer != null) {
+          clearTimeout(pressTimer);
+        }
+        pressTimer = null;
+        ev.stopPropagation();
+      }
+    };
     registerFocusable(card, entry, entry ? entry.cards.length : 0);
     rail.appendChild(card);
     return card;
@@ -549,10 +605,15 @@
     openVod('csp_Media', item.vod_id || item.id, item.vod_name || item.name, item.vod_pic || item.pic);
   }
   function openHistory(item) {
-    /* key 实际为三段 siteKey@@@vodId@@@cid(VideoActivity.getHistoryKey),取前两段 */
-    var parts = String(item.key || '').split('@@@');
-    var siteKey = parts.length >= 2 ? parts[0] : '';
-    var vodId = parts.length >= 2 ? parts[1] : '';
+    /* JJ-html 的 fm.history 直接带 siteKey/vodId 字段;WebHome 原生 key 为三段
+     * siteKey@@@vodId@@@cid(VideoActivity.getHistoryKey),取前两段 */
+    var siteKey = item.siteKey || '';
+    var vodId = item.vodId || '';
+    if (!siteKey || !vodId) {
+      var parts = String(item.key || '').split('@@@');
+      siteKey = parts.length >= 2 ? parts[0] : '';
+      vodId = parts.length >= 2 ? parts[1] : '';
+    }
     if (siteKey && vodId) {
       openVod(siteKey, vodId, item.vodName, item.vodPic);
     } else {
@@ -565,7 +626,7 @@
   var overlayState = null;
 
   function playBase() {
-    return location.origin + '/play' + (token && token !== '-' ? '/' + token : '');
+    return SERVER + '/play' + (token && token !== '-' ? '/' + token : '');
   }
 
   function overlayButtons() {
@@ -667,6 +728,8 @@
 
   function showDetailPage() {
     qs('detail-page').classList.add('show');
+    /* JJ-html 加载器的返回键检查 detail-active 等 class,命中才派发 Escape 而非直接关弹窗 */
+    document.body.className += ' detail-active';
     try {
       history.pushState({ fmDetail: 1 }, '', '#detail');
       detailPushed = true;
@@ -675,6 +738,7 @@
 
   function hideDetailPage() {
     qs('detail-page').classList.remove('show');
+    document.body.className = document.body.className.replace(/\s*detail-active\b/, '');
   }
 
   window.addEventListener('popstate', function () {
