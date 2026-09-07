@@ -844,6 +844,13 @@ public class MediaSubscriptionService {
         if (StringUtils.isBlank(stored)) {
             return stored;
         }
+        /* 防递归:已是绝对 /images 代理形态不再包一层。listCache 缓存的列表条目是共享实例,
+         * 调用方逐次 setVod_pic(absoluteCover(...)) 会把已代理地址再包一层
+         * (/images?url=/images?url=… N 层嵌套,图床侧 400),先短路已代理形态;
+         * 相对形态 "/images?..." 仍需走下方按请求 host 重建绝对地址。 */
+        if (stored.startsWith("http") && stored.contains("/images?url=")) {
+            return stored;
+        }
         if (stored.startsWith("http")) {
             stored = proxiedCover(stored);
         }

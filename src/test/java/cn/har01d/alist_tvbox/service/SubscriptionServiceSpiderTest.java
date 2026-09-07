@@ -118,12 +118,36 @@ class SubscriptionServiceSpiderTest {
         assertNotNull(config.get("sites"));
     }
 
+    @Test
+    void webHomeSiteInjectedOnlyForCapableClient() {
+        WebHomeService capable = mock(WebHomeService.class);
+        when(capable.isCapable(anyString())).thenReturn(true);
+        SubscriptionService service = newService("{}", capable);
+        Map<String, Object> config = service.subscription("", "http://up.example/config.json", "", null);
+        List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+        assertEquals("atv_home", sites.get(0).get("key"));
+        assertEquals("csp_Builtin", sites.get(0).get("api"));
+        assertEquals("http://atv.example/webhome/app.html?token=-&v=10", sites.get(0).get("homePage"));
+
+        // 原版 FongMi 等不支持端:mock 默认 false,不注入
+        SubscriptionService plain = newService("{}");
+        Map<String, Object> config2 = plain.subscription("", "http://up.example/config.json", "", null);
+        List<Map<String, Object>> sites2 = (List<Map<String, Object>>) config2.get("sites");
+        for (Map<String, Object> site : sites2) {
+            assertEquals(false, "atv_home".equals(site.get("key")));
+        }
+    }
+
     private Map<String, Object> findSite(Map<String, Object> config, String key) {
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
         return sites.stream().filter(s -> key.equals(s.get("key"))).findFirst().orElseThrow();
     }
 
     private SubscriptionService newService(String upstreamJson) {
+        return newService(upstreamJson, mock(WebHomeService.class));
+    }
+
+    private SubscriptionService newService(String upstreamJson, WebHomeService webHomeService) {
         SettingRepository settingRepository = mock(SettingRepository.class);
         when(settingRepository.findById(anyString())).thenAnswer(invocation -> {
             Object key = invocation.getArgument(0);
@@ -165,7 +189,8 @@ class SubscriptionServiceSpiderTest {
                 mock(UserService.class),
                 mock(FileDownloader.class),
                 subscriptionSourceService,
-                mock(PlaybackTokenRepository.class)
+                mock(PlaybackTokenRepository.class),
+                webHomeService
         );
 
         ReflectionTestUtils.setField(service, "okHttpClient", httpServerReturning(upstreamJson));

@@ -44,27 +44,34 @@ public class MediaLibraryController {
     private final SubscriptionService subscriptionService;
     private final MediaSubscriptionService mediaSubscriptionService;
     private final PianDanService pianDanService;
+    private final cn.har01d.alist_tvbox.service.WebHomeService webHomeService;
 
     public MediaLibraryController(SubscriptionService subscriptionService,
                                   MediaSubscriptionService mediaSubscriptionService,
-                                  PianDanService pianDanService) {
+                                  PianDanService pianDanService,
+                                  cn.har01d.alist_tvbox.service.WebHomeService webHomeService) {
         this.subscriptionService = subscriptionService;
         this.mediaSubscriptionService = mediaSubscriptionService;
         this.pianDanService = pianDanService;
+        this.webHomeService = webHomeService;
     }
 
     @GetMapping("/media")
     public Object browse(String id, String t, String ac, String wd, String title,
                          @RequestParam(required = false, defaultValue = "1") int pg,
-                         @RequestParam Map<String, String> params) {
-        return browse("", id, t, ac, wd, title, pg, params);
+                         @RequestParam Map<String, String> params,
+                         jakarta.servlet.http.HttpServletRequest request) {
+        return browse("", id, t, ac, wd, title, pg, params, request);
     }
 
     @GetMapping("/media/{token}")
     public Object browse(@PathVariable String token, String id, String t, String ac, String wd, String title,
                          @RequestParam(required = false, defaultValue = "1") int pg,
-                         @RequestParam Map<String, String> params) {
+                         @RequestParam Map<String, String> params,
+                         jakarta.servlet.http.HttpServletRequest request) {
         subscriptionService.checkToken(token);
+        // spider 运行时探测宿主 WebHome 桥接类后随请求上报(X-CLIENT-CAPS);webhtv 独占包名亦可直接判定
+        webHomeService.recordCapability(token, request.getHeader("X-CLIENT-CAPS"), request.getHeader("X-CLIENT"));
         int uid = mediaSubscriptionService.resolveUid(token);
         if (StringUtils.isNotBlank(id)) {
             if (isPianDanId(id)) {
