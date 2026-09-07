@@ -1448,7 +1448,7 @@ public class SubscriptionService {
         // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
         // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
         String homeToken = token.isBlank() ? "-" : token;
-        site.put("homePage", readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=14");
+        site.put("homePage", readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=16");
         sites.removeIf(item -> "atv_home".equals(item.get("key")));
         sites.add(0, site);
         log.debug("add WebHome site: token={}", homeToken);

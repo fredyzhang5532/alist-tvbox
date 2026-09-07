@@ -128,7 +128,7 @@ class SubscriptionServiceSpiderTest {
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
         assertEquals("atv_home", sites.get(0).get("key"));
         assertEquals("csp_Builtin", sites.get(0).get("api"));
-        assertEquals("http://atv.example/webhome/app.html?token=-&v=14", sites.get(0).get("homePage"));
+        assertEquals("http://atv.example/webhome/app.html?token=-&v=16", sites.get(0).get("homePage"));
 
         // 原版 FongMi/OK影视等普通端:不注入
         SubscriptionService plain = newService("{}");
