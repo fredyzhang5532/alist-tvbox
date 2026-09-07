@@ -1876,7 +1876,9 @@ public class MediaSubscriptionCheckService {
             // 季起始集号下界:分季订阅对齐后季前旧集不在缺口口径(与 computeMissing 同规)
             int lower = current.getSeasonStartEpisode() != null && current.getSeasonStartEpisode() > 1
                     ? current.getSeasonStartEpisode() : 1;
-            for (int i = lower; i <= Math.min(official, 500); i++) {
+            // 上限与 computeMissing 同口径(MAX_EPISODE_ROWS):旧硬编码 500 把长番 500 集后的缺口全隐掉
+            // (海贼王官方已播 1176,缺 1175/1176 却报「本地已全部同步」)
+            for (int i = lower; i <= Math.min(official, MediaSubscriptionService.MAX_EPISODE_ROWS); i++) {
                 if (!local.contains(i)) {
                     missing.add(i);
                 }

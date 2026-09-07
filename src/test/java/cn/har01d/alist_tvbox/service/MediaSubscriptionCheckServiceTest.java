@@ -1459,6 +1459,35 @@ class MediaSubscriptionCheckServiceTest {
                         && e.getDetail().contains("检查更新")));
     }
 
+    // ---------- 线上事故回归:海贼王 sub48,官方已播 1176/本地 1174 却报「已全部同步」 ----------
+    // 缺口扫描曾硬编码 500 上限:长番 500 集之后的真实缺口(1175/1176)全部隐掉。
+    // 与 computeMissing 同口径 MAX_EPISODE_ROWS(旧值 500 曾把柯南 1200+ 集的 27 个缺口隐掉)。
+
+    @Test
+    void checkUpdateReportsGapBeyondEpisodeFiveHundred() {
+        Fixture fixture = new Fixture();
+        fixture.subscription.setMetaProvider("tmdb");
+        fixture.subscription.setMetaId("37854");
+        fixture.subscription.setOfficialEpisodes(1151);
+        fixture.subscription.setOfficialTotal(1155);
+        fixture.subscription.setOfficialStatus(MetadataDetails.STATUS_RETURNING);
+        MetadataDetails details = new MetadataDetails();
+        details.setTotalEpisodes(1181);
+        details.setAiredEpisodes(1176); // 修复后 provider 采纳剧级权威已播
+        details.setStatus(MetadataDetails.STATUS_RETURNING);
+        Mockito.when(fixture.metadataService.refreshDetails(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenReturn(details);
+        Mockito.when(fixture.episodeSourceRepository.findNumbersBySubscriptionAndStatesIn(Mockito.eq(1), Mockito.anyCollection()))
+                .thenReturn(numbers(1, 1174));
+
+        String message = fixture.service.checkUpdateNow(0, 1);
+
+        assertTrue(message.contains("官方已播至第 1176 集"), message);
+        assertTrue(message.contains("缺第 1175,1176 集"), "500 集后的缺口必须报出: " + message);
+        assertEquals(MediaSubscription.STATUS_ACTIVE, fixture.subscription.getStatus(),
+                "未集齐(1174 < 1181)不得完结");
+    }
+
     // ---------- 退役/拒绝冷却重探 ----------
 
     @Test
