@@ -82,6 +82,7 @@ import java.util.stream.Collectors;
 
 import static cn.har01d.alist_tvbox.util.Constants.ALI_SECRET;
 import static cn.har01d.alist_tvbox.util.Constants.BILIBILI_COOKIE;
+import static cn.har01d.alist_tvbox.util.Constants.ANONYMOUS_ACCESS;
 import static cn.har01d.alist_tvbox.util.Constants.ENABLED_TOKEN;
 import static cn.har01d.alist_tvbox.util.Constants.TOKEN;
 import static cn.har01d.alist_tvbox.util.Constants.USER_TOKEN_PREFIX;
@@ -129,6 +130,8 @@ public class SubscriptionService {
     private final ThreadLocal<String> verifiedUserToken = new ThreadLocal<>();
 
     private String tokens = "";
+    // 亲友共享模式:安全订阅开启时仍放行无 token 请求,并为其注入首个安全 token(老订阅地址零改动)
+    private boolean anonymousAccess;
 
     public SubscriptionService(Environment environment,
                                AppProperties appProperties,
@@ -203,6 +206,9 @@ public class SubscriptionService {
         if (!settingRepository.existsByName(ENABLED_TOKEN)) {
             settingRepository.save(new Setting(ENABLED_TOKEN, String.valueOf(!tokens.isEmpty())));
         }
+        anonymousAccess = Boolean.parseBoolean(settingRepository.findById(ANONYMOUS_ACCESS)
+                .map(Setting::getValue)
+                .orElse("false"));
 
         if (list.isEmpty()) {
             Subscription sub = new Subscription();
@@ -347,6 +353,11 @@ public class SubscriptionService {
             return;
         }
 
+        // 亲友共享模式:无 token 请求放行(仍以匿名身份下发配置,个人订阅/凭证端点照旧校验)
+        if (anonymousAccess && rawToken.isBlank()) {
+            return;
+        }
+
         // 全局 tokens 优先匹配:与用户名撞车时按共享 token 处理,避免被用户名分支抢走
         for (String t : tokens.split(",")) {
             if (t.equals(rawToken)) {
@@ -463,6 +474,7 @@ public class SubscriptionService {
     public TokenDto getTokens() {
         TokenDto tokenDto = new TokenDto();
         tokenDto.setEnabledToken(appProperties.isEnabledToken());
+        tokenDto.setAnonymousAccess(anonymousAccess);
 
         String role = Optional.of(SecurityContextHolder.getContext())
                 .map(SecurityContext::getAuthentication)
@@ -531,6 +543,9 @@ public class SubscriptionService {
         settingRepository.save(new Setting(ENABLED_TOKEN, String.valueOf(dto.isEnabledToken())));
         settingRepository.save(new Setting(TOKEN, tokens));
         appProperties.setEnabledToken(dto.isEnabledToken());
+        anonymousAccess = dto.isAnonymousAccess();
+        settingRepository.save(new Setting(ANONYMOUS_ACCESS, String.valueOf(anonymousAccess)));
+        dto.setAnonymousAccess(anonymousAccess);
         return dto;
     }
 
@@ -1844,8 +1859,12 @@ public class SubscriptionService {
                 json = appendMd5sum(name, json);
                 // 用当前请求 token(订阅 token、USER 用户名、或无 token 的 "")原样注入;仅 currentToken==null(未走 checkToken 的可信内部/管理端,如 getCatalog)才回退全局首个订阅 token。
                 // 关键:/sub/{id} 等用户路径会经 checkToken 把 currentToken 设为 "",不算"内部",不注入全局 —— 避免无 token 客户端拿到全局订阅 token 再访问 tokenm/zx/tvfan
+                // 例外:亲友共享模式(anonymousAccess)下用户显式接受该泄漏面,匿名请求也注入首个 token,老订阅地址零改动
                 String currentReqToken = currentToken.get();
                 String subToken = currentReqToken != null ? currentReqToken : getFirstSubscriptionToken();
+                if (StringUtils.isBlank(subToken) && anonymousAccess) {
+                    subToken = getFirstSubscriptionToken();
+                }
                 // u- 用户 token 升级为凭证形态再入 URL:tokenm 只认带密钥形态(裸 u- 无熵),
                 // zx/tvfan 目前本就只收共享 token,嵌入哪种都会 400,不影响
                 subToken = userService.toCredentialToken(subToken);
@@ -1966,9 +1985,13 @@ public class SubscriptionService {
             json = json.replace("{Cloud-drive", "{\"Cloud-drive");
             if (json.contains("tvfan/Cloud-drive.txt")) {
                 String address = readHostAddress();
-                // 同 loadLocalConfigJson:用户请求(含空 token "")原样注入,仅 currentToken==null 的可信内部场景回退全局首个
+                // 同 loadLocalConfigJson:用户请求(含空 token "")原样注入,仅 currentToken==null 的可信内部场景回退全局首个;
+                // 亲友共享模式下匿名请求同样回退首个 token
                 String currentReqToken = currentToken.get();
                 String subToken = currentReqToken != null ? currentReqToken : getFirstSubscriptionToken();
+                if (StringUtils.isBlank(subToken) && anonymousAccess) {
+                    subToken = getFirstSubscriptionToken();
+                }
                 json = json.replace("tvfan/Cloud-drive.txt", address + "/tvfan/config" + (StringUtils.isBlank(subToken) ? "" : "?token=" + subToken));
             }
 
