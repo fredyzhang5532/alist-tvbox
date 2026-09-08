@@ -98,6 +98,8 @@ public class SubscriptionService {
     private static final String AUTO_UPDATE_ZX = "auto_update_zx";
     private static final String AUTO_UPDATE_XS = "auto_update_xs";
     private static final String SYSTEM_PLAYBACK_TOKEN_NAME = "系统订阅同步";
+    /** WebHome 网页首页站点 key(内置源之一,订阅源管理可禁用/调序/改名)。 */
+    private static final String WEB_HOME_KEY = "atv_home";
 
     private final Environment environment;
     private final AppProperties appProperties;
@@ -1401,25 +1403,37 @@ public class SubscriptionService {
         for (SubscriptionSourceService.SubscriptionSourceRef source : subscriptionSourceService.findEnabledSources()) {
             try {
                 if (source.builtin()) {
-                    Map<String, Object> site = buildSite(embedToken, secret, uid, source.siteKey(), source.name(),
-                            playbackToken, configUrl);
-                    site.put("order", order);
-                    // key transformation for csp_Push (needed before override lookup)
-                    if ("csp_Push".equals(source.siteKey())) {
-                        site.put("key", "push_agent");
+                    if (WEB_HOME_KEY.equals(source.siteKey())) {
+                        // WebHome 网页首页站(非 spider 站点):独立构建 + 客户端能力门禁,
+                        // 启用/顺序/名称来自订阅源管理;普通端静默跳过(order 顺延无害)
+                        if (webHomeService.isCapable(token)) {
+                            Map<String, Object> site = buildWebHomeSite(token, source.name());
+                            site.put("order", order);
+                            applySiteOverride(WEB_HOME_KEY, site, sites);
+                            sites.add(id++, site);
+                            log.debug("add builtin source {}: {}", source.siteKey(), site);
+                        }
+                    } else {
+                        Map<String, Object> site = buildSite(embedToken, secret, uid, source.siteKey(), source.name(),
+                                playbackToken, configUrl);
+                        site.put("order", order);
+                        // key transformation for csp_Push (needed before override lookup)
+                        if ("csp_Push".equals(source.siteKey())) {
+                            site.put("key", "push_agent");
+                        }
+                        if ("csp_AList".equals(source.siteKey())) {
+                            sites.removeIf(item -> "Alist".equals(item.get("key")));
+                        } else if ("csp_Push".equals(source.siteKey())) {
+                            sites.removeIf(item -> "push_agent".equals(item.get("key")));
+                        }
+                        // apply user override from config.sites (partial entry added by overrideConfig)
+                        String overrideKey = (String) site.get("key");
+                        boolean overridden = applySiteOverride(overrideKey, site, sites);
+                        // special defaults when no user override
+                        applyBuiltinSiteCapabilities(source.siteKey(), overridden, site);
+                        sites.add(id++, site);
+                        log.debug("add builtin source {}: {}", source.siteKey(), site);
                     }
-                    if ("csp_AList".equals(source.siteKey())) {
-                        sites.removeIf(item -> "Alist".equals(item.get("key")));
-                    } else if ("csp_Push".equals(source.siteKey())) {
-                        sites.removeIf(item -> "push_agent".equals(item.get("key")));
-                    }
-                    // apply user override from config.sites (partial entry added by overrideConfig)
-                    String overrideKey = (String) site.get("key");
-                    boolean overridden = applySiteOverride(overrideKey, site, sites);
-                    // special defaults when no user override
-                    applyBuiltinSiteCapabilities(source.siteKey(), overridden, site);
-                    sites.add(id++, site);
-                    log.debug("add builtin source {}: {}", source.siteKey(), site);
                 } else if (source.plugin() != null) {
                     Map<String, Object> site = buildPluginSite(source.plugin(), embedToken, secret,
                             playbackToken, configUrl);
@@ -1433,29 +1447,23 @@ public class SubscriptionService {
                 log.warn("add source failed: {}", source.id(), e);
             }
         }
-        addWebHomeSite(token, sites);
         return order;
     }
 
     /**
      * WebHome 自定义网页首页站点(webhtv/fish 等魔改端):type 3 + homePage,客户端切到
      * 该站点首页时加载我们的网页(注入 fm SDK),卡片经 fm.vod 走 csp_Media 原生详情链路。
-     * 仅对已知支持 WebHome 的客户端 token 注入 —— 原版 FongMi 解析不了 csp_Builtin,
-     * 无差别下发会给不支持端留一个死站点。能力由 spider 运行时探测回传
-     * (见 {@link WebHomeService});首次配好订阅先无此站,spider 跑过一次后
-     * 下次刷新配置即出现。
+     * 随订阅源管理(可禁用/调序/改名)下发;仅对已知支持 WebHome 的客户端 token 注入 ——
+     * 原版 FongMi 解析不了 csp_Builtin,无差别下发会给不支持端留一个死站点。
+     * 能力由 spider 运行时探测回传(见 {@link WebHomeService});首次配好订阅先无此站,
+     * spider 跑过一次后下次刷新配置即出现。
      */
-    private void addWebHomeSite(String token, List<Map<String, Object>> sites) {
-        if (!webHomeService.isCapable(token)) {
-            return;
-        }
+    private Map<String, Object> buildWebHomeSite(String token, String name) {
         Map<String, Object> site = new HashMap<>();
-        site.put("key", "atv_home");
-        site.put("name", "影视首页");
+        site.put("key", WEB_HOME_KEY);
+        site.put("name", StringUtils.defaultIfBlank(name, "影视首页"));
         site.put("type", 3);
         site.put("api", "csp_Builtin");
-        // 内置源 order 从 1000 起,置 0 保证 sortSitesByOrder 后仍居首位(站点选择器首位,易切换)
-        site.put("order", 0);
         site.put("searchable", 0);
         site.put("quickSearch", 0);
         site.put("filterable", 0);
@@ -1464,9 +1472,8 @@ public class SubscriptionService {
         // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
         String homeToken = token.isBlank() ? "-" : token;
         site.put("homePage", readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=16");
-        sites.removeIf(item -> "atv_home".equals(item.get("key")));
-        sites.add(0, site);
         log.debug("add WebHome site: token={}", homeToken);
+        return site;
     }
 
     static void applyBuiltinSiteCapabilities(String key, boolean overridden, Map<String, Object> site) {
@@ -2128,6 +2135,11 @@ public class SubscriptionService {
                 continue;
             }
             builtinPluginKeys.add(key);
+            // WebHome 首页站仅对能力端(webhtv/fish)随配置注入,普通影视订阅不含此站,
+            // 站点目录(配置编辑器)不返回;key 仍参与去重,用户手写的 atv_home 条目也不进自定义站点列表
+            if (WEB_HOME_KEY.equals(key)) {
+                continue;
+            }
             Map<String, Object> item = new HashMap<>();
             item.put("key", key);
             item.put("name", source.name() == null ? key : source.name());

@@ -267,6 +267,9 @@ public class SubscriptionSourceService {
     private List<BuiltinDefinition> builtinDefinitions() {
         List<BuiltinDefinition> definitions = new ArrayList<>();
         int order = 1;
+        // WebHome 网页首页站(非 spider 站点,SubscriptionService.addSite 特判构建):
+        // 与其它内置源同权管理 —— 列表可见、可禁用、可调序;是否随订阅下发仍按客户端能力门禁
+        definitions.add(new BuiltinDefinition("atv_home", "影视首页", order++));
         definitions.add(new BuiltinDefinition("csp_PianDan", "片单导航", order++));
         Site xiaoya = siteRepository.findById(1).orElse(null);
         if (xiaoya != null) {

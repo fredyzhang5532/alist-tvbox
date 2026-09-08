@@ -53,6 +53,10 @@ class SubscriptionServiceSpiderTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    /** 订阅源管理里的 WebHome 内置源条目(builtin-atv_home,findEnabledSources 消费形态)。 */
+    private static final SubscriptionSourceService.SubscriptionSourceRef WEB_HOME_SOURCE =
+            new SubscriptionSourceService.SubscriptionSourceRef("builtin-atv_home", true, "atv_home", "影视首页", null);
+
     @BeforeEach
     void setUp() {
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/sub/token/1");
@@ -120,20 +124,32 @@ class SubscriptionServiceSpiderTest {
 
     @Test
     void webHomeSiteInjectedOnlyForCapableClient() {
-        // 能力端(webhtv/fish):注入 homePage 站点,原生 WebHome 直接加载网页
+        // 能力端(webhtv/fish):订阅源管理已启用 → 注入 homePage 站点,原生 WebHome 直接加载网页
         WebHomeService capable = mock(WebHomeService.class);
         when(capable.isCapable(anyString())).thenReturn(true);
-        SubscriptionService service = newService("{}", capable);
+        SubscriptionService service = newService("{}", capable, List.of(WEB_HOME_SOURCE));
         Map<String, Object> config = service.subscription("", "http://up.example/config.json", "", null);
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
         assertEquals("atv_home", sites.get(0).get("key"));
         assertEquals("csp_Builtin", sites.get(0).get("api"));
         assertEquals("http://atv.example/webhome/app.html?token=-&v=16", sites.get(0).get("homePage"));
 
-        // 原版 FongMi/OK影视等普通端:不注入
-        SubscriptionService plain = newService("{}");
+        // 原版 FongMi/OK影视等普通端:订阅源已启用也不注入(能力门禁)
+        SubscriptionService plain = newService("{}", mock(WebHomeService.class), List.of(WEB_HOME_SOURCE));
         Map<String, Object> config2 = plain.subscription("", "http://up.example/config.json", "", null);
         for (Map<String, Object> site : (List<Map<String, Object>>) config2.get("sites")) {
+            assertEquals(false, "atv_home".equals(site.get("key")));
+        }
+    }
+
+    @Test
+    void webHomeSiteFollowsSubscriptionSourceSwitch() {
+        // 订阅源管理里禁用 atv_home:即便客户端能力达标也不再注入
+        WebHomeService capable = mock(WebHomeService.class);
+        when(capable.isCapable(anyString())).thenReturn(true);
+        SubscriptionService service = newService("{}", capable, List.of());
+        Map<String, Object> config = service.subscription("", "http://up.example/config.json", "", null);
+        for (Map<String, Object> site : (List<Map<String, Object>>) config.get("sites")) {
             assertEquals(false, "atv_home".equals(site.get("key")));
         }
     }
@@ -148,6 +164,11 @@ class SubscriptionServiceSpiderTest {
     }
 
     private SubscriptionService newService(String upstreamJson, WebHomeService webHomeService) {
+        return newService(upstreamJson, webHomeService, List.of());
+    }
+
+    private SubscriptionService newService(String upstreamJson, WebHomeService webHomeService,
+                                           List<SubscriptionSourceService.SubscriptionSourceRef> sources) {
         SettingRepository settingRepository = mock(SettingRepository.class);
         when(settingRepository.findById(anyString())).thenAnswer(invocation -> {
             Object key = invocation.getArgument(0);
@@ -164,7 +185,7 @@ class SubscriptionServiceSpiderTest {
         when(driverAccountRepository.findByTypeAndMasterTrue(any())).thenReturn(Optional.empty());
 
         SubscriptionSourceService subscriptionSourceService = mock(SubscriptionSourceService.class);
-        when(subscriptionSourceService.findEnabledSources()).thenReturn(List.of());
+        when(subscriptionSourceService.findEnabledSources()).thenReturn(sources);
 
         SubscriptionService service = new SubscriptionService(
                 mock(Environment.class),

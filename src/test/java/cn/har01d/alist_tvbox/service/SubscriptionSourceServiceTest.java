@@ -50,5 +50,14 @@ class SubscriptionSourceServiceTest {
                         .returns("片单导航", SubscriptionSourceService.ManagedSource::name)
                         .returns(true, SubscriptionSourceService.ManagedSource::builtin)
                         .returns(true, SubscriptionSourceService.ManagedSource::enabled));
+
+        // WebHome 首页站与其它内置源同权管理:默认启用且居首位(站点选择器首位)
+        List<SubscriptionSourceService.ManagedSource> all = service.findAll();
+        assertThat(all.get(0))
+                .returns("atv_home", SubscriptionSourceService.ManagedSource::key)
+                .returns("影视首页", SubscriptionSourceService.ManagedSource::name)
+                .returns(true, SubscriptionSourceService.ManagedSource::builtin)
+                .returns(true, SubscriptionSourceService.ManagedSource::enabled)
+                .returns(1, SubscriptionSourceService.ManagedSource::sortOrder);
     }
 }
