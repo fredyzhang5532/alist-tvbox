@@ -520,6 +520,12 @@
 
   /* ---------- 遥控器/键盘焦点导航(行×列空间移动) ---------- */
   var focusables = [];  /* { node, entry, index } 与 rowRegistry 同序 */
+  /* 指针交互(触屏/鼠标)期间来的焦点不滚动:点击→焦点→滚动居中会把卡片移出手指/光标下方,
+   * 浏览器按「内容发生移动」取消本次合成 click(= 要点两次才能进详情;卡片已居中/无法
+   * 再移动时才一次生效)。键盘/遥控器导航没有指针事件,照常滚动对齐。 */
+  var lastPointerAt = 0;
+  document.addEventListener('touchstart', function () { lastPointerAt = Date.now(); }, true);
+  document.addEventListener('mousedown', function () { lastPointerAt = Date.now(); }, true);
   function registerFocusable(node, entry, index) {
     var record = { node: node, entry: entry, index: index };
     focusables.push(record);
@@ -527,7 +533,7 @@
     node.addEventListener('focus', function () {
       current = record;
       node.classList.add('focus');
-      scrollIntoViewCompat(node);
+      if (Date.now() - lastPointerAt > 400) scrollIntoViewCompat(node);
     });
     node.addEventListener('blur', function () { node.classList.remove('focus'); });
     return record;
