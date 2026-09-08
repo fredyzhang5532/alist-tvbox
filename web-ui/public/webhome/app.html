@@ -503,32 +503,15 @@
       if (action) action(item, card);
     };
     card.onclick = run;
-    /* 长按 700ms = 全局搜索该剧(参考 tmdb.html bindRemotePress) */
-    var pressTimer = null;
+    /* 长按搜索已按需求下线:原实现的「长按后合成 click 压制」在 keyup 被跳走的搜索页吃掉后
+     * 会粘住,吞掉下一次真实点击(= 有时要点两次才能进详情);搜索入口收敛到详情页搜索按钮
+     * 与顶部搜索框。Enter 键下沉到卡片即止(防 document 处理器再触发 current.node.click()
+     * 造成双重激活),激活由 keyup 合成 click 完成 —— 与原短按路径完全一致 */
     card.onkeydown = function (ev) {
-      if (ev.key === 'Enter' || ev.keyCode === 23 || ev.keyCode === 13) {
-        if (pressTimer == null) {
-          pressTimer = setTimeout(function () {
-            pressTimer = 'fired';
-            doSearch(name);
-          }, 700);
-        }
-        ev.stopPropagation();
-      }
+      if (ev.key === 'Enter' || ev.keyCode === 23 || ev.keyCode === 13) ev.stopPropagation();
     };
     card.onkeyup = function (ev) {
-      if (ev.key === 'Enter' || ev.keyCode === 23 || ev.keyCode === 13) {
-        if (pressTimer === 'fired') {
-          card.onclick = function () { };  /* 长按后的合成 click 压制 */
-          setTimeout(function () { card.onclick = run; }, 300);
-          ev.preventDefault();
-          ev.stopPropagation();
-        } else if (pressTimer != null) {
-          clearTimeout(pressTimer);
-        }
-        pressTimer = null;
-        ev.stopPropagation();
-      }
+      if (ev.key === 'Enter' || ev.keyCode === 23 || ev.keyCode === 13) ev.stopPropagation();
     };
     registerFocusable(card, entry, entry ? entry.cards.length : 0);
     rail.appendChild(card);
