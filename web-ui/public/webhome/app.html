@@ -373,6 +373,12 @@
     if (m) token = decodeURIComponent(m[1].replace(/\+/g, '%20'));
   } catch (e) { token = ''; }
   if (!token && window.ATV_TOKEN) token = String(window.ATV_TOKEN);
+  /* 播放同步专用令牌(URL ?pt=):继续观看的服务端数据源,不依赖宿主桥 */
+  var ptok = '';
+  try {
+    var ptm = location.search.match(/[?&]pt=([^&]*)/);
+    if (ptm) ptok = decodeURIComponent(ptm[1].replace(/\+/g, '%20'));
+  } catch (e) { ptok = ''; }
   var API_BASE = SERVER + '/media' + (token && token !== '-' ? '/' + encodeURIComponent(token) : '');
 
   function getJson(url) {
@@ -943,11 +949,38 @@
     showHero(0);
   }
 
+  /* 服务端播放记录(每剧最新一条):页面自带 pt 直连 /api/playback/changes,
+   * 同源 fetch+请求头 —— 桥/SDK 全不可用时继续观看也必有数据(双保险的另一路) */
+  function serverHistory() {
+    if (!ptok) return Promise.resolve([]);
+    return fetch(SERVER + '/api/playback/changes', {
+      headers: { 'X-PlaySync-Token': ptok, 'X-PlaySync-Latest': 'true', 'X-PlaySync-Limit': '20' }
+    }).then(function (r) { return r.json(); }).then(function (page) {
+      var items = page && page.items ? page.items : [];
+      var out = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (!it.sourceKey || !it.vodId) continue;
+        out.push({
+          siteKey: it.sourceKey, vodId: it.vodId,
+          key: it.sourceKey + '@@@' + it.vodId + '@@@0',
+          vodName: it.vodName, vodPic: it.vodPic, vodRemarks: it.episodeName
+        });
+      }
+      return out;
+    });
+  }
+
   function loadHistory(entry) {
-    if (!(fm && fm.history)) { setState(entry, null); return Promise.resolve(); }
-    return fm.history().then(function (list) {
-      if (!list || !list.length) { setState(entry, null); return; }
-      renderCards(entry, list.slice(0, 20), openHistory);
+    var viaFm = (fm && fm.history)
+      ? fm.history().catch(function () { return null; })
+      : Promise.resolve(null);
+    return viaFm.then(function (list) {
+      if (list && list.length) { renderCards(entry, list.slice(0, 20), openHistory); return; }
+      return serverHistory().then(function (items) {
+        if (items && items.length) { renderCards(entry, items.slice(0, 20), openHistory); }
+        else { setState(entry, null); }
+      });
     }).catch(function () { setState(entry, null); });
   }
 
