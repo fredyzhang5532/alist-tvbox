@@ -1404,10 +1404,10 @@ public class SubscriptionService {
             try {
                 if (source.builtin()) {
                     if (WEB_HOME_KEY.equals(source.siteKey())) {
-                        // WebHome 网页首页站:能力端(webhtv/fish)下发原生 homePage 形态,
-                        // 普通端(原版 FongMi/OK影视等)下发 csp_WebHome spider 形态
-                        // (spring.jar 全屏 WebView 加载同一页面);启用/顺序/名称来自订阅源管理
-                        Map<String, Object> site = buildWebHomeSite(token, source.name(), webHomeService.isCapable(token));
+                        // WebHome 网页首页站:单形态通吃(webhtv/fish 按 homePage 字段原生渲染,
+                        // 字段驱动与 api 名无关;普通端由 spring.jar csp_WebHome spider 弹窗加载);
+                        // 启用/顺序/名称来自订阅源管理
+                        Map<String, Object> site = buildWebHomeSite(token, source.name());
                         site.put("order", order);
                         applySiteOverride(WEB_HOME_KEY, site, sites);
                         sites.add(id++, site);
@@ -1450,40 +1450,40 @@ public class SubscriptionService {
     }
 
     /**
-     * WebHome 自定义网页首页站点,按客户端能力二选一形态(同一 URL 同一 token,页面零改动):
-     * 能力端(webhtv/fish 等原生 WebHome 客户端)= csp_Builtin + homePage,宿主直载页面并注入自家 fm SDK;
-     * 普通端(原版 FongMi/OK影视等) = csp_WebHome + ext,spring.jar spider 全屏 WebView 加载同一页面,
-     * spider 注入最小 fm SDK(vod/history/search 反射宿主 VideoActivity/SearchActivity/History),
-     * 播放仍走宿主原生详情链路(VideoActivity.start(key,id))。ext 为 base64(JSON) 字符串
-     * (同 csp_Media 形态,宿主透传保底)。随订阅源管理(可禁用/调序/改名)下发。
+     * WebHome 自定义网页首页站点:单形态通吃所有客户端 —— homePage 字段(webhtv/fish 按
+     * site.hasHomePage() 字段驱动原生渲染,与 api 名无关,已核 fish_webhtv HomeWebController)
+     * + api=csp_WebHome(原版 FongMi/OK影视 无 homePage 概念,由 spring.jar spider 全屏
+     * WebView 加载 ext 里的同一 URL,注入最小 fm SDK)。同一 URL 同一 token,页面零改动;
+     * 能力探测记忆(WebHomeService)不再参与形态选择 —— 同 token 多设备混用(一台 webhtv
+     * 把 token 标成能力端,同 token 的原版端曾因此拿到解析不了的原生形态)无法在配置拉取时
+     * 区分客户端,双形态必错一边。ext 为 base64(JSON)(同 csp_Media 宿主透传保底)。
+     * 随订阅源管理(可禁用/调序/改名)下发。
      */
-    private Map<String, Object> buildWebHomeSite(String token, String name, boolean capable) {
+    private Map<String, Object> buildWebHomeSite(String token, String name) {
+        String homeToken = token.isBlank() ? "-" : token;
+        // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
+        // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
+        String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=16";
         Map<String, Object> site = new HashMap<>();
         site.put("key", WEB_HOME_KEY);
         site.put("name", StringUtils.defaultIfBlank(name, "影视首页"));
         site.put("type", 3);
+        site.put("api", "csp_WebHome");
+        site.put("homePage", pageUrl);
         site.put("searchable", 0);
         site.put("quickSearch", 0);
         site.put("filterable", 0);
         site.put("changeable", 0);
-        // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
-        // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
-        String homeToken = token.isBlank() ? "-" : token;
-        String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=16";
-        if (capable) {
-            site.put("api", "csp_Builtin");
-            site.put("homePage", pageUrl);
-        } else {
-            site.put("api", "csp_WebHome");
-            Map<String, Object> ext = new HashMap<>();
-            ext.put("url", pageUrl);
-            try {
-                site.put("ext", Base64.getEncoder().encodeToString(objectMapper.writeValueAsString(ext).replaceAll("\\s", "").getBytes()));
-            } catch (JsonProcessingException e) {
-                throw new IllegalStateException("encode WebHome ext failed", e);
-            }
+        // 显式 jar(与其他内置源一致):防宿主不回落全局 spider 或全局位被覆盖
+        site.put("jar", readHostAddress("") + "/spring.jar");
+        Map<String, Object> ext = new HashMap<>();
+        ext.put("url", pageUrl);
+        try {
+            site.put("ext", Base64.getEncoder().encodeToString(objectMapper.writeValueAsString(ext).replaceAll("\\s", "").getBytes()));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("encode WebHome ext failed", e);
         }
-        log.debug("add WebHome site: token={} capable={}", homeToken, capable);
+        log.debug("add WebHome site: token={}", homeToken);
         return site;
     }
 
