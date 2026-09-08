@@ -1469,7 +1469,7 @@ public class SubscriptionService {
         String homeToken = token.isBlank() ? "-" : token;
         // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
         // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
-        String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=18";
+        String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=19";
         Map<String, Object> site = buildWebHomeLikeSite(WEB_HOME_KEY, name, pageUrl);
         log.debug("add WebHome site: token={}", homeToken);
         return site;

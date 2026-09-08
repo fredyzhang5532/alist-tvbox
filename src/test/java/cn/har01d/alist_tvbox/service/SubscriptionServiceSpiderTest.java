@@ -157,11 +157,11 @@ class SubscriptionServiceSpiderTest {
         Map<String, Object> config = service.subscription("", "http://up.example/config.json", "", null);
         Map<String, Object> atvHome = findSite(config, "atv_home");
         assertEquals("csp_WebHome", atvHome.get("api"));
-        assertEquals("http://atv.example/webhome/app.html?token=-&v=18", atvHome.get("homePage"));
+        assertEquals("http://atv.example/webhome/app.html?token=-&v=19", atvHome.get("homePage"));
         // 显式 jar(与其他内置源一致):防宿主不回落全局 spider 或全局位被覆盖
         assertEquals("http://atv.example/spring.jar", atvHome.get("jar"));
         // ext = 明文 JSON 字符串(spider 端 parseExt 先试明文 JSON,base64 仅兼容回退)
-        assertEquals("{\"url\":\"http://atv.example/webhome/app.html?token=-&v=18\"}", atvHome.get("ext"));
+        assertEquals("{\"url\":\"http://atv.example/webhome/app.html?token=-&v=19\"}", atvHome.get("ext"));
 
         // 普通端(未标记能力):同一形态
         SubscriptionService plain = newService("{}", mock(WebHomeService.class), List.of(WEB_HOME_SOURCE));

@@ -979,6 +979,7 @@
   }
 
   var booted = false;
+  var contEntry = null;  /* 继续观看行:fmsdk 晚到竞态时补拉用 */
   function boot() {
     /* window.fm 已就绪与 fmsdk 事件可能双双触发,重复 boot 会把所有行/榜单建两遍 */
     if (booted) return;
@@ -994,6 +995,7 @@
     var ended = buildRow('已完结', null, null);
     /* 继续观看行插在最前(依赖 fm.history) */
     var cont = buildRow('继续观看', null, null);
+    contEntry = cont;
     rowsBox.insertBefore(cont.rowEl, rowsBox.firstChild);
     rowRegistry.splice(rowRegistry.indexOf(cont), 1);
     rowRegistry.unshift(cont);
@@ -1017,7 +1019,13 @@
   /* ---------- SDK 就绪 ---------- */
   function ensureFm() {
     if (window.fm) { fm = window.fm; boot(); return; }
-    window.addEventListener('fmsdk', function () { fm = window.fm; boot(); });
+    window.addEventListener('fmsdk', function () {
+      fm = window.fm;
+      if (!booted) { boot(); return; }
+      /* 慢加载竞态:600ms 降级 boot 已跑过而 fm 后到(sdk 在 onPageFinished 注入,
+       * 慢 WebView/慢网络下晚于降级定时器),继续观看行当时因无 fm 被跳过 —— fm 就绪补拉 */
+      if (contEntry && !contEntry.cards.length) { loadHistory(contEntry); }
+    });
     /* 非 App 环境直接渲染(浏览器预览) */
     setTimeout(function () {
       if (!window.fm && !native) { boot(); }
