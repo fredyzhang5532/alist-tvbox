@@ -662,6 +662,10 @@
               <el-input v-model="notifyForm.chatId" placeholder="与 bot 对话后获取"/>
               <span v-if="!store.admin" class="sub-text">个人 TG 通知渠道:留空时沿用管理员配置的全局渠道</span>
             </el-form-item>
+            <el-form-item v-if="store.admin" label="TG 代理">
+              <el-input v-model="notifyForm.botProxy" placeholder="http://192.168.1.2:7890 或 socks5://...,留空直连"/>
+              <span class="sub-text">服务器访问 Telegram API(机器人收发+追剧通知)走的代理,只作用于机器人不影响网盘请求;保存后下一轮拉取即生效,无需重启。容器环境变量 HTTP_PROXY 对 Java 后端无效</span>
+            </el-form-item>
             <el-form-item label="免打扰时段">
               <el-input v-model="notifyForm.quietHours" placeholder="23:00-08:00,留空立即发送"/>
               <span class="sub-text">时段内(可跨零点)巡检通知推迟到时段结束合并送达;凌晨巡检不半夜响铃</span>
@@ -1356,6 +1360,7 @@ const notifyForm = ref({
   botToken: '',
   chatId: '',
   quietHours: '',
+  botProxy: '',
   botEnabled: true,
   collectionFallback: false,
   doubanCookie: '',
@@ -2378,6 +2383,7 @@ const openNotify = () => {
     notifyForm.value.botToken = settings['msub_telegram_bot_token'] || ''
     notifyForm.value.chatId = settings['msub_telegram_chat_id'] || ''
     notifyForm.value.quietHours = settings['msub_notify_quiet_hours'] || ''
+    notifyForm.value.botProxy = settings['msub_telegram_proxy'] || ''
     notifyForm.value.botEnabled = settings['msub_telegram_bot_enabled'] !== 'false'
     notifyForm.value.collectionFallback = settings['msub_collection_fallback'] === 'true'
     notifyForm.value.doubanCookie = settings['douban_cookie'] || ''
@@ -2455,6 +2461,7 @@ const saveNotify = () => {
     axios.post('/api/settings', {name: 'msub_telegram_bot_token', value: notifyForm.value.botToken}),
     axios.post('/api/settings', {name: 'msub_telegram_chat_id', value: notifyForm.value.chatId}),
     axios.post('/api/settings', {name: 'msub_notify_quiet_hours', value: notifyForm.value.quietHours.trim()}),
+    axios.post('/api/settings', {name: 'msub_telegram_proxy', value: notifyForm.value.botProxy.trim()}),
     axios.post('/api/settings', {name: 'msub_telegram_bot_enabled', value: String(notifyForm.value.botEnabled)}),
     axios.post('/api/settings', {name: 'msub_collection_fallback', value: String(notifyForm.value.collectionFallback)}),
     axios.post('/api/settings', {name: 'douban_cookie', value: notifyForm.value.doubanCookie}),
