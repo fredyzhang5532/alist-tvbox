@@ -287,6 +287,8 @@ public class MediaSubscriptionCheckService {
     private static final String INDEX_TEMPLATE_NAME = "追剧";
     /** 补缺源内部目录(藏于 /追剧/ 下的点目录,用户视角每部剧只有一个文件夹入口) */
     private static final String GAP_SOURCES_ROOT = cn.har01d.alist_tvbox.util.Constants.SUBSCRIPTION_MOUNT_ROOT + ".sources/";
+    /** 手动路径资源 link 前缀(与磁力 offline: 同款合成方案):path: + AList 绝对路径,非分享链接 */
+    private static final String PATH_LINK_PREFIX = "path:";
     /** AList 整体不可用时本轮跳过后的短间隔重试(15min,下个每小时 sweep 即可捞到) */
     private static final long INVALID_RETRY_DELAY_MS = 15 * 60_000L;
     /** 播放选源排序:VERIFIED > LISTED,再按资源分/成功率 —— 转存副本优先级由调用方排在前 */
@@ -1146,6 +1148,18 @@ public class MediaSubscriptionCheckService {
                 && !MediaSubscriptionResource.STATE_REJECTED.equals(state)) {
             return; // 幂等:候选/已挂载无需恢复
         }
+        if (isPathResource(resource)) {
+            // 路径资源不回候选池(无分享链接,探测流永远救不回):恢复=重列目录原位重新入账
+            try {
+                resource.setFailKind(null);
+                registerPathResource(subscription, resource);
+                addEvent(id, MediaSubscriptionEvent.TYPE_POOL_FILLED,
+                        "已恢复路径资源(重新入账):" + StringUtils.defaultString(resource.getTitle()), false);
+            } catch (Exception e) {
+                throw new cn.har01d.alist_tvbox.exception.BadRequestException("路径资源恢复失败:" + e.getMessage(), e);
+            }
+            return;
+        }
         boolean wasRetired = MediaSubscriptionResource.STATE_RETIRED.equals(state)
                 || MediaSubscriptionResource.STATE_REJECTED.equals(state);
         resource.setState(MediaSubscriptionResource.STATE_CANDIDATE);
@@ -1178,6 +1192,10 @@ public class MediaSubscriptionCheckService {
         MediaSubscriptionResource resource = resourceRepository.findById(resourceId).orElse(null);
         if (resource == null || resource.getSubscriptionId() != id) {
             throw new cn.har01d.alist_tvbox.exception.BadRequestException("候选资源不存在: " + resourceId);
+        }
+        if (isPathResource(resource)) {
+            // 路径资源直连用户网盘目录:无分享链接可挂到订阅固定路径,转主源请钉选分享类候选
+            throw new cn.har01d.alist_tvbox.exception.BadRequestException("路径资源不支持转主源:目录只作补缺线路供流");
         }
         executor.submit(() -> {
             if (!tryLock(id)) {
@@ -1257,6 +1275,15 @@ public class MediaSubscriptionCheckService {
      *  失败处置沿用 probeCandidateSafely 分级(限流不退役/异剧不拉黑/瞬时累计);挂载失败不退役 ——
      *  探测已证明链接活着,挂载炸多半是 AList 侧问题,退回候选池下轮补缺重探即可。 */
     void mountCandidate(MediaSubscription subscription, MediaSubscriptionResource resource) {
+        if (isPathResource(resource)) {
+            // 路径资源无分享链接可探测/挂载:启用=重列目录刷新入账(目录原位增长也能手动触发同步)
+            try {
+                registerPathResource(subscription, resource);
+            } catch (Exception e) {
+                addEvent(subscription.getId(), MediaSubscriptionEvent.TYPE_ERROR, "路径资源刷新失败:" + e.getMessage());
+            }
+            return;
+        }
         if (probeCandidateSafely(subscription, resource) != ProbeOutcome.PROBED) {
             return; // 失败已按分级处置(事件/退役/限流退避)
         }
@@ -3124,8 +3151,9 @@ public class MediaSubscriptionCheckService {
                 continue;
             }
             if (!belongsToShow(subscription, resource, files.keySet())) {
-                if (Boolean.TRUE.equals(resource.getPinned())) {
-                    // 钉选豁免归属复核(与主源复核同款):用户否决自动判定,补缺挂载原样保留
+                if (Boolean.TRUE.equals(resource.getPinned()) || isPathResource(resource)) {
+                    // 钉选豁免归属复核(与主源复核同款):用户否决自动判定,补缺挂载原样保留;
+                    // 路径资源同款豁免 —— 用户亲自贴的目录(官方集数登记滞后/不同剪辑版会误触复核)
                     log.info("subscription {} pinned aux mount failed ownership recheck, kept (user override): {}",
                             subscription.getId(), resource.getMountPath());
                     continue;
@@ -3835,6 +3863,22 @@ public class MediaSubscriptionCheckService {
         return resource != null && MediaSubscriptionResource.SOURCE_MAGNET.equals(resource.getSource());
     }
 
+    // ---------- 手动路径资源(用户粘贴已挂载网盘目录直连,issue #1071) ----------
+
+    /** 路径资源(link=path:/…):非 Share 挂载,目录本就存在于 AList,巡检只刷新不挂卸。 */
+    static boolean isPathResource(MediaSubscriptionResource resource) {
+        return resource != null && resource.getLink() != null && resource.getLink().startsWith(PATH_LINK_PREFIX);
+    }
+
+    /** 路径资源 link(path:/xxx) → 目录路径;非路径资源返回 null。 */
+    static String pathOf(String link) {
+        if (StringUtils.isBlank(link) || !link.startsWith(PATH_LINK_PREFIX)) {
+            return null;
+        }
+        String path = link.substring(PATH_LINK_PREFIX.length());
+        return StringUtils.isBlank(path) ? null : path;
+    }
+
     /**
      * 磁力兜底入口(fillGaps 尾部):转存优先 —— 网盘源池内探测+补搜穷尽(自定义词轮+单集词轮)仍缺,
      * 且订阅开了磁力兜底、离线下载已配置,才扫描收割离线产物(覆盖上轮超时任务)并在仍缺时提交新磁力。
@@ -4196,6 +4240,81 @@ public class MediaSubscriptionCheckService {
         return covered;
     }
 
+    /**
+     * 手动路径资源入账(网页「添加资源」粘贴已挂载网盘目录,issue #1071):按磁力产物同款形态落库 ——
+     * state=MOUNTED、mount_path=目录本身、share_id=null(目录本就存在于 AList,无需挂卸),
+     * 列举识别集文件过异剧/时长门禁后落集源行,播放/盘线路照常按行走。
+     * 门禁不过抛 IllegalStateException(调用方把消息回给用户);目录原位增长由 refreshAuxMounts 每轮重列承接。
+     * @return 入账覆盖的集号
+     */
+    Set<Integer> registerPathResource(MediaSubscription subscription, MediaSubscriptionResource resource) {
+        String path = pathOf(resource.getLink());
+        if (path == null) {
+            throw new IllegalStateException("路径资源格式不正确:" + resource.getLink());
+        }
+        TreeMap<Integer, EpisodeFile> files = new TreeMap<>();
+        collectResourceEpisodeFiles(site(), subscription, resource, path, files, episodeSizePolicy(subscription), true);
+        sanitizeEpisodeFiles(subscription, resource, files, resource.getTitle());
+        if (files.isEmpty()) {
+            throw new IllegalStateException("目录里没有可识别的本季剧集文件:" + path);
+        }
+        if (episodeNumbersForeign(subscription, files.keySet(), metaGenres(subscription))) {
+            throw new IllegalStateException(foreignShowReason(subscription, files.lastKey(), resource.getTitle()));
+        }
+        if (episodeDurationForeign(metaRuntimeMinutes(subscription), files.values())) {
+            throw new IllegalStateException(FOREIGN_SHOW_MARK + "(单集时长与官方不符):" + resource.getTitle());
+        }
+        resource.setState(MediaSubscriptionResource.STATE_MOUNTED);
+        resource.setMountPath(path);
+        resource.setShareId(null);
+        resource.setFailKind(null);
+        resource.setCheckedTime(System.currentTimeMillis());
+        resourceRepository.save(resource);
+        syncInventory(subscription, resource, path, files);
+        resourceRepository.save(resource); // episodesFound 由 syncInventory 回填
+        Set<Integer> covered = files.keySet();
+        addEvent(subscription.getId(), MediaSubscriptionEvent.TYPE_GAP_FILLED,
+                "路径资源入账 第" + joinNumbers(new ArrayList<>(covered)) + " 集(来自 "
+                        + StringUtils.abbreviate(path, 60) + ")");
+        gapSearchRounds.remove(subscription.getId());
+        log.info("subscription {} registered path resource {} at {} ({} episodes)",
+                subscription.getId(), resource.getId(), path, covered.size());
+        return covered;
+    }
+
+    /**
+     * 目录选择器数据(issue #1071):path 下的子目录名(仅目录,名称排序,超 1000 截断);
+     * path 空 = 根,即已挂载存储列表。目录不可访问抛 400,选择器把消息展示给用户。
+     */
+    public List<String> browseDriveDirs(String path) {
+        String dir = StringUtils.trimToEmpty(path);
+        if (StringUtils.isNotBlank(dir)
+                && (!dir.startsWith("/") || dir.contains("/../") || dir.endsWith("/.."))) {
+            throw new cn.har01d.alist_tvbox.exception.BadRequestException("目录路径不合法");
+        }
+        if (StringUtils.isBlank(dir) || "/".equals(dir)) {
+            dir = "/";
+        }
+        FsResponse response;
+        try {
+            response = aListService.listFiles(site(), dir, 1, 0, false);
+        } catch (Exception e) {
+            throw new cn.har01d.alist_tvbox.exception.BadRequestException(
+                    "目录不可访问:" + dir + "(" + StringUtils.defaultString(e.getMessage()) + ")");
+        }
+        List<FsInfo> files = response == null ? null : response.getFiles();
+        if (files == null) {
+            return List.of();
+        }
+        return files.stream()
+                .filter(f -> f.getType() == 1)
+                .map(FsInfo::getName)
+                .filter(StringUtils::isNotBlank)
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .limit(1000)
+                .toList();
+    }
+
     /** 收割后仍缺时提交新磁力(每轮最多 1 个,转存优先语义下的最后兜底)。
      * 三档离线配额(单集/单订阅/总,Setting 可配,0=不限)按提交尝试计数(含 FAILED,task 表跨轮持久),
      * 计数窗口为自然月——每月1号归零(与网盘离线配额的月度节奏对齐);
@@ -4537,8 +4656,9 @@ public class MediaSubscriptionCheckService {
         MediaSubscriptionResource weakest = null;
         int weakestUnique = Integer.MAX_VALUE;
         for (MediaSubscriptionResource aux : auxes) {
-            if (isMagnetResource(aux)) {
-                continue; // 磁力产物不参与换血:被挤回候选池会进探测流(probeShare 分享语义),且产物文件是实打实下载的
+            if (isMagnetResource(aux) || isPathResource(aux)) {
+                continue; // 磁力产物不参与换血:被挤回候选池会进探测流(probeShare 分享语义),且产物文件是实打实下载的;
+                // 路径资源同理:用户亲自贴的目录,挤掉=丢供流,候选也永远探测不回(无分享链接)
             }
             Set<Integer> unique = new TreeSet<>(coverageByAux.get(aux.getId()));
             for (MediaSubscriptionResource other : auxes) {
@@ -5535,6 +5655,9 @@ public class MediaSubscriptionCheckService {
     /** 单集资源(每集一链)不挂主源:主源承载整季清单与固定挂载,换单集会把观测集数打回 1、
      * 触发全量缺集误判;单集链接只配做补缺。本地不足 2 集(新剧首集/电影)时不限制。 */
     boolean usableAsPrimary(MediaSubscriptionResource resource, int currentEpisodes) {
+        if (isPathResource(resource)) {
+            return false; // 路径资源直连用户网盘目录:无分享链接可挂到订阅固定路径,只作补缺线路
+        }
         if (currentEpisodes < 2) {
             return true;
         }
