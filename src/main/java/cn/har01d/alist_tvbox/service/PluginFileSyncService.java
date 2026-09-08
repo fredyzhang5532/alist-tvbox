@@ -29,10 +29,13 @@ public class PluginFileSyncService {
 
     private final PluginService pluginService;
     private final PluginRepository pluginRepository;
+    private final SubscriptionSourceService subscriptionSourceService;
 
-    public PluginFileSyncService(PluginService pluginService, PluginRepository pluginRepository) {
+    public PluginFileSyncService(PluginService pluginService, PluginRepository pluginRepository,
+                                 SubscriptionSourceService subscriptionSourceService) {
         this.pluginService = pluginService;
         this.pluginRepository = pluginRepository;
+        this.subscriptionSourceService = subscriptionSourceService;
     }
 
     /**
@@ -164,6 +167,11 @@ public class PluginFileSyncService {
             reconcile();
         } catch (Exception e) {
             log.warn("startup plugin file reconcile failed", e);
+        }
+        try {
+            subscriptionSourceService.migrateWebPagesToFrontOnce();
+        } catch (Exception e) {
+            log.warn("startup web pages front migrate failed", e);
         }
     }
 }

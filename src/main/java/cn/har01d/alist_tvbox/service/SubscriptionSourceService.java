@@ -29,6 +29,7 @@ import java.util.Set;
 public class SubscriptionSourceService {
     private static final String BUILTIN_SETTINGS_KEY = "builtin_subscription_sources";
     private static final String SORT_ORDER_MIGRATED_KEY = "subscription_source_sort_order_migrated";
+    private static final String WEB_PAGES_FRONT_MIGRATED = "web_pages_front_migrated";
     private static final Set<String> EXTENDABLE_BUILTINS =
             Set.of("csp_PianDan", "csp_FishPanSou", "csp_FishPanSouGroup");
 
@@ -183,6 +184,44 @@ public class SubscriptionSourceService {
      * 把插件行挪到插件区最前(第一个非内置源之前,全内置则追加尾部即内置之后):
      * 新上传的自定义网页源不沉底;其余源保持相对顺序,订阅源管理中仍可任意调序。
      */
+    /**
+     * 存量自定义网页源一次性前置:首版上传的网页源落在插件区之后(moveToFrontOfPlugins
+     * 仅对新建行生效,重扫保留既有位置),启动时一次性把它们挪到插件区最前;
+     * 迁移标志防重复,之后用户在订阅源管理里的手动调序不再被动。
+     */
+    public synchronized void migrateWebPagesToFrontOnce() {
+        if (settingRepository.existsByName(WEB_PAGES_FRONT_MIGRATED)) {
+            return;
+        }
+        List<ManagedSource> all = findAll();
+        List<String> webPageIds = new ArrayList<>();
+        for (ManagedSource source : all) {
+            if (!source.builtin() && source.url() != null
+                    && source.url().startsWith(PluginService.WEB_PAGE_URL_PREFIX)) {
+                webPageIds.add(source.id());
+            }
+        }
+        if (!webPageIds.isEmpty()) {
+            List<String> ordered = new ArrayList<>();
+            boolean inserted = false;
+            for (ManagedSource source : all) {
+                if (webPageIds.contains(source.id())) {
+                    continue;
+                }
+                if (!inserted && !source.builtin()) {
+                    ordered.addAll(webPageIds);
+                    inserted = true;
+                }
+                ordered.add(source.id());
+            }
+            if (!inserted) {
+                ordered.addAll(webPageIds);
+            }
+            reorder(ordered);
+        }
+        settingRepository.save(new Setting(WEB_PAGES_FRONT_MIGRATED, "true"));
+    }
+
     public synchronized void moveToFrontOfPlugins(String pluginRowId) {
         List<ManagedSource> all = findAll();
         if (all.stream().noneMatch(source -> pluginRowId.equals(source.id()))) {

@@ -6,6 +6,7 @@ import cn.har01d.alist_tvbox.entity.FeiniuRepository;
 import cn.har01d.alist_tvbox.entity.JellyfinRepository;
 import cn.har01d.alist_tvbox.entity.Plugin;
 import cn.har01d.alist_tvbox.entity.PluginRepository;
+import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
 import cn.har01d.alist_tvbox.entity.SiteRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -62,6 +63,63 @@ class SubscriptionSourceServiceTest {
                 .returns(true, SubscriptionSourceService.ManagedSource::builtin)
                 .returns(true, SubscriptionSourceService.ManagedSource::enabled)
                 .returns(1, SubscriptionSourceService.ManagedSource::sortOrder);
+    }
+
+    @Test
+    void migrateWebPagesToFrontMovesLegacyRowsOnce() {
+        // 存量迁移:首版落底的网页行一次性挪到插件区最前(相对顺序保留),标志防重复
+        PluginRepository pluginRepository = mock(PluginRepository.class);
+        SettingRepository settingRepository = mock(SettingRepository.class);
+        SiteRepository siteRepository = mock(SiteRepository.class);
+        EmbyRepository embyRepository = mock(EmbyRepository.class);
+        FeiniuRepository feiniuRepository = mock(FeiniuRepository.class);
+        JellyfinRepository jellyfinRepository = mock(JellyfinRepository.class);
+        when(settingRepository.findById("builtin_subscription_sources")).thenReturn(Optional.empty());
+        when(siteRepository.findById(1)).thenReturn(Optional.empty());
+        when(embyRepository.count()).thenReturn(0L);
+        when(feiniuRepository.count()).thenReturn(0L);
+        when(jellyfinRepository.count()).thenReturn(0L);
+        when(settingRepository.existsByName("web_pages_front_migrated")).thenReturn(false);
+
+        Plugin pyPlugin = new Plugin();
+        pyPlugin.setId(1);
+        pyPlugin.setSortOrder(15);
+        pyPlugin.setName("爬虫");
+        Plugin page1 = new Plugin();
+        page1.setId(2);
+        page1.setSortOrder(16);
+        page1.setName("网页1");
+        page1.setUrl("/static/webhome/pages/p1.html");
+        Plugin page2 = new Plugin();
+        page2.setId(3);
+        page2.setSortOrder(17);
+        page2.setName("网页2");
+        page2.setUrl("/static/webhome/pages/p2.html");
+        when(pluginRepository.findAllByOrderBySortOrderAscIdAsc()).thenReturn(List.of(pyPlugin, page1, page2));
+        when(pluginRepository.findById(1)).thenReturn(Optional.of(pyPlugin));
+        when(pluginRepository.findById(2)).thenReturn(Optional.of(page1));
+        when(pluginRepository.findById(3)).thenReturn(Optional.of(page2));
+
+        SubscriptionSourceService service = new SubscriptionSourceService(
+                new AppProperties(),
+                pluginRepository,
+                settingRepository,
+                siteRepository,
+                embyRepository,
+                feiniuRepository,
+                jellyfinRepository,
+                new ObjectMapper()
+        );
+
+        service.migrateWebPagesToFrontOnce();
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Plugin>> captor = ArgumentCaptor.forClass((Class) List.class);
+        verify(pluginRepository).saveAll(captor.capture());
+        List<Plugin> saved = captor.getValue();
+        assertThat(saved).extracting(Plugin::getId).containsExactly(2, 3, 1);
+        verify(settingRepository).save(org.mockito.ArgumentMatchers.argThat(
+                arg -> arg != null && "web_pages_front_migrated".equals(arg.getName())));
     }
 
     @Test

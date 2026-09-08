@@ -35,12 +35,14 @@ class PluginFileSyncServiceTest {
     private PluginService pluginService;
     @Mock
     private PluginRepository pluginRepository;
+    @Mock
+    private SubscriptionSourceService subscriptionSourceService;
 
     private PluginFileSyncService service;
 
     @BeforeEach
     void setUp() {
-        service = new PluginFileSyncService(pluginService, pluginRepository);
+        service = new PluginFileSyncService(pluginService, pluginRepository, subscriptionSourceService);
     }
 
     @Test
