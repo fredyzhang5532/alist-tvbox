@@ -180,7 +180,10 @@ public class PluginService {
         plugin.setSortOrder(subscriptionSourceService.nextSortOrder());
         plugin.setLastCheckedAt(OffsetDateTime.now());
         plugin.setLastError("");
-        return pluginRepository.save(plugin);
+        Plugin saved = pluginRepository.save(plugin);
+        // 新网页源插到插件区最前(内置源之后、其它插件之前),不沉底;重扫已有条目不重排
+        subscriptionSourceService.moveToFrontOfPlugins("plugin-" + saved.getId());
+        return saved;
     }
 
     /** 是否为文件-backed 自定义网页源(区别于 spider 插件,站点走 csp_WebHome 形态)。 */

@@ -9,6 +9,7 @@ import cn.har01d.alist_tvbox.entity.PluginRepository;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
 import cn.har01d.alist_tvbox.entity.SiteRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.mockito.ArgumentCaptor;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -16,6 +17,7 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class SubscriptionSourceServiceTest {
@@ -60,6 +62,54 @@ class SubscriptionSourceServiceTest {
                 .returns(true, SubscriptionSourceService.ManagedSource::builtin)
                 .returns(true, SubscriptionSourceService.ManagedSource::enabled)
                 .returns(1, SubscriptionSourceService.ManagedSource::sortOrder);
+    }
+
+    @Test
+    void moveToFrontOfPluginsInsertsBeforeOtherPlugins() {
+        // 新网页源插入第一个非内置源之前(插件区最前),其余源相对顺序不变
+        PluginRepository pluginRepository = mock(PluginRepository.class);
+        SettingRepository settingRepository = mock(SettingRepository.class);
+        SiteRepository siteRepository = mock(SiteRepository.class);
+        EmbyRepository embyRepository = mock(EmbyRepository.class);
+        FeiniuRepository feiniuRepository = mock(FeiniuRepository.class);
+        JellyfinRepository jellyfinRepository = mock(JellyfinRepository.class);
+        when(settingRepository.findById("builtin_subscription_sources")).thenReturn(Optional.empty());
+        when(siteRepository.findById(1)).thenReturn(Optional.empty());
+        when(embyRepository.count()).thenReturn(0L);
+        when(feiniuRepository.count()).thenReturn(0L);
+        when(jellyfinRepository.count()).thenReturn(0L);
+
+        Plugin pyPlugin = new Plugin();
+        pyPlugin.setId(1);
+        pyPlugin.setSortOrder(15);
+        pyPlugin.setName("爬虫");
+        Plugin page = new Plugin();
+        page.setId(2);
+        page.setSortOrder(16);
+        page.setName("网页");
+        when(pluginRepository.findAllByOrderBySortOrderAscIdAsc()).thenReturn(List.of(pyPlugin, page));
+        when(pluginRepository.findById(1)).thenReturn(Optional.of(pyPlugin));
+        when(pluginRepository.findById(2)).thenReturn(Optional.of(page));
+
+        SubscriptionSourceService service = new SubscriptionSourceService(
+                new AppProperties(),
+                pluginRepository,
+                settingRepository,
+                siteRepository,
+                embyRepository,
+                feiniuRepository,
+                jellyfinRepository,
+                new ObjectMapper()
+        );
+
+        service.moveToFrontOfPlugins("plugin-2");
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Plugin>> captor = ArgumentCaptor.forClass((Class) List.class);
+        verify(pluginRepository).saveAll(captor.capture());
+        List<Plugin> saved = captor.getValue();
+        assertThat(saved).extracting(Plugin::getId).containsExactly(2, 1);
+        assertThat(saved.get(0).getSortOrder()).isEqualTo(saved.get(1).getSortOrder() - 1);
     }
 
     @Test

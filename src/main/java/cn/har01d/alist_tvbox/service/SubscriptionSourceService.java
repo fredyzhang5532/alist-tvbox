@@ -179,6 +179,32 @@ public class SubscriptionSourceService {
         saveBuiltinSettings(settings);
     }
 
+    /**
+     * 把插件行挪到插件区最前(第一个非内置源之前,全内置则追加尾部即内置之后):
+     * 新上传的自定义网页源不沉底;其余源保持相对顺序,订阅源管理中仍可任意调序。
+     */
+    public synchronized void moveToFrontOfPlugins(String pluginRowId) {
+        List<ManagedSource> all = findAll();
+        if (all.stream().noneMatch(source -> pluginRowId.equals(source.id()))) {
+            return;
+        }
+        List<String> ordered = new ArrayList<>();
+        boolean inserted = false;
+        for (ManagedSource source : all) {
+            if (!inserted && !source.builtin() && !pluginRowId.equals(source.id())) {
+                ordered.add(pluginRowId);
+                inserted = true;
+            }
+            if (!pluginRowId.equals(source.id())) {
+                ordered.add(source.id());
+            }
+        }
+        if (!inserted) {
+            ordered.add(pluginRowId);
+        }
+        reorder(ordered);
+    }
+
     public void normalizeSortOrders() {
         reorder(findAll().stream().map(ManagedSource::id).toList());
     }
