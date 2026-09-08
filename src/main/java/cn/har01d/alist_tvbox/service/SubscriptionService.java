@@ -1509,7 +1509,9 @@ public class SubscriptionService {
         // spider fm.history 桥的兜底数据源 —— 服务端播放记录(跨设备继续观看)
         ext.put("pt", StringUtils.defaultString(playbackToken));
         try {
-            site.put("ext", objectMapper.writeValueAsString(ext));
+            // base64(JSON),与 csp_Media 等其它源一致(spider 端 parseExt 先试 base64,兼容明文)
+            site.put("ext", Base64.getEncoder().encodeToString(
+                    objectMapper.writeValueAsString(ext).replaceAll("\\s", "").getBytes()));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("encode WebHome ext failed", e);
         }

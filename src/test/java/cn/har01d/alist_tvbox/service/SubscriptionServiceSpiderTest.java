@@ -77,7 +77,7 @@ class SubscriptionServiceSpiderTest {
         assertEquals("我的电影库", site.get("name"));
         assertEquals("http://atv.example/webhome/pages/电影库.html", site.get("homePage"));
         assertEquals("http://atv.example/spring.jar", site.get("jar"));
-        String pageExt = (String) site.get("ext");
+        String pageExt = new String(java.util.Base64.getDecoder().decode((String) site.get("ext")));
         assertTrue(pageExt.contains("\"url\":\"http://atv.example/webhome/pages/电影库.html\""));
         assertEquals(0, site.get("searchable"));
     }
@@ -162,8 +162,8 @@ class SubscriptionServiceSpiderTest {
         assertEquals("http://atv.example/webhome/app.html?token=-&v=19", atvHome.get("homePage"));
         // 显式 jar(与其他内置源一致):防宿主不回落全局 spider 或全局位被覆盖
         assertEquals("http://atv.example/spring.jar", atvHome.get("jar"));
-        // ext = 明文 JSON(url + pt 播放同步专用令牌,测试桩下为空;键序不保证,按内容断言)
-        String ext = (String) atvHome.get("ext");
+        // ext = base64(JSON)(与 csp_Media 等其它源一致;url + pt 播放同步专用令牌,测试桩下 pt 为空)
+        String ext = new String(java.util.Base64.getDecoder().decode((String) atvHome.get("ext")));
         assertTrue(ext.contains("\"url\":\"http://atv.example/webhome/app.html?token=-&v=19\""));
         assertTrue(ext.contains("\"pt\":\"\""));
 
