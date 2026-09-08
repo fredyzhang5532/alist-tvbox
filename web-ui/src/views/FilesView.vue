@@ -88,6 +88,15 @@
           </template>
         </el-alert>
 
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px">
+          <template #title>
+            <p>
+              将自定义首页 HTML 命名为 <code>app.html</code> 上传到 <strong>webhome</strong> 文件夹，可替换 TV 客户端
+              <strong>「影视首页」</strong>（WebHome）的内置页面（zip 解压上传可附带 css/js/图片等相对资源）；删除该文件即恢复内置页面。
+            </p>
+          </template>
+        </el-alert>
+
         <el-table ref="staticTableRef" :data="staticFiles" border style="width: 100%" v-loading="staticLoading"
                   @row-dblclick="handleRowDblClick" @selection-change="handleSelectionChange">
           <el-table-column type="selection" width="45"/>
