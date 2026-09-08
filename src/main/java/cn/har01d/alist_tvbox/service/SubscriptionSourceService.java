@@ -235,6 +235,8 @@ public class SubscriptionSourceService {
     }
 
     private ManagedSourceHolder buildPluginSource(Plugin plugin) {
+        // 自定义网页源:文件即内容,「刷新」按 spider 插件逻辑下载解析无意义,隐藏
+        boolean webPage = PluginService.isWebPagePlugin(plugin);
         ManagedSource source = new ManagedSource(
                 "plugin-" + plugin.getId(),
                 false,
@@ -250,8 +252,8 @@ public class SubscriptionSourceService {
                 plugin.getLastCheckedAt() == null ? "" : plugin.getLastCheckedAt().toString(),
                 StringUtils.defaultString(plugin.getLastError()),
                 true,
-                true,
-                true
+                !webPage,
+                !webPage
         );
         return new ManagedSourceHolder(source, plugin);
     }

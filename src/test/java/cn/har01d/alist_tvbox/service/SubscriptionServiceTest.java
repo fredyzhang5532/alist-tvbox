@@ -174,6 +174,24 @@ class SubscriptionServiceTest {
     }
 
     @Test
+    void webPageSiteKeyDerivesFromFileName() {
+        // 自定义网页源站点目录 key 与下发站点一致(web_ 前缀,特殊字符折叠,纯中文回落插件 id)
+        Plugin page = new Plugin();
+        page.setId(12);
+        page.setUrl("/static/webhome/pages/movie-4K.html");
+        assertThat(SubscriptionService.pluginSiteKey(page)).isEqualTo("web_movie_4K");
+
+        Plugin chinese = new Plugin();
+        chinese.setId(34);
+        chinese.setUrl("/static/webhome/pages/电影库.html");
+        assertThat(SubscriptionService.pluginSiteKey(chinese)).isEqualTo("web_34");
+
+        Plugin normal = new Plugin();
+        normal.setId(56);
+        assertThat(SubscriptionService.pluginSiteKey(normal)).isEqualTo("plugin-56");
+    }
+
+    @Test
     void pluginSiteKeyDoesNotChangeWhenDisplayNameChanges() {
         Plugin plugin = new Plugin();
         plugin.setId(7);

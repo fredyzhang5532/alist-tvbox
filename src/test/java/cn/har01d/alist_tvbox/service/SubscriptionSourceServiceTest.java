@@ -4,6 +4,7 @@ import cn.har01d.alist_tvbox.config.AppProperties;
 import cn.har01d.alist_tvbox.entity.EmbyRepository;
 import cn.har01d.alist_tvbox.entity.FeiniuRepository;
 import cn.har01d.alist_tvbox.entity.JellyfinRepository;
+import cn.har01d.alist_tvbox.entity.Plugin;
 import cn.har01d.alist_tvbox.entity.PluginRepository;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
 import cn.har01d.alist_tvbox.entity.SiteRepository;
@@ -59,5 +60,45 @@ class SubscriptionSourceServiceTest {
                 .returns(true, SubscriptionSourceService.ManagedSource::builtin)
                 .returns(true, SubscriptionSourceService.ManagedSource::enabled)
                 .returns(1, SubscriptionSourceService.ManagedSource::sortOrder);
+    }
+
+    @Test
+    void webPageSourceIsNotRefreshable() {
+        // 自定义网页源:文件即内容,「刷新」按 spider 插件逻辑无意义,隐藏刷新/配置入口
+        PluginRepository pluginRepository = mock(PluginRepository.class);
+        SettingRepository settingRepository = mock(SettingRepository.class);
+        SiteRepository siteRepository = mock(SiteRepository.class);
+        EmbyRepository embyRepository = mock(EmbyRepository.class);
+        FeiniuRepository feiniuRepository = mock(FeiniuRepository.class);
+        JellyfinRepository jellyfinRepository = mock(JellyfinRepository.class);
+        when(settingRepository.findById("builtin_subscription_sources")).thenReturn(Optional.empty());
+        when(siteRepository.findById(1)).thenReturn(Optional.empty());
+        when(embyRepository.count()).thenReturn(0L);
+        when(feiniuRepository.count()).thenReturn(0L);
+        when(jellyfinRepository.count()).thenReturn(0L);
+
+        Plugin page = new Plugin();
+        page.setId(5);
+        page.setSortOrder(10);
+        page.setName("电影库");
+        page.setUrl("/static/webhome/pages/电影库.html");
+        when(pluginRepository.findAllByOrderBySortOrderAscIdAsc()).thenReturn(List.of(page));
+
+        SubscriptionSourceService service = new SubscriptionSourceService(
+                new AppProperties(),
+                pluginRepository,
+                settingRepository,
+                siteRepository,
+                embyRepository,
+                feiniuRepository,
+                jellyfinRepository,
+                new ObjectMapper()
+        );
+
+        assertThat(service.findAll())
+                .anySatisfy(source -> assertThat(source)
+                        .returns("/static/webhome/pages/电影库.html", SubscriptionSourceService.ManagedSource::url)
+                        .returns(false, SubscriptionSourceService.ManagedSource::refreshable)
+                        .returns(false, SubscriptionSourceService.ManagedSource::extendable));
     }
 }

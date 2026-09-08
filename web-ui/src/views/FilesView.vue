@@ -97,6 +97,15 @@
           </template>
         </el-alert>
 
+        <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 10px">
+          <template #title>
+            <p>
+              将 <code>.html</code> 网页上传到 <strong>webhome/pages</strong> 文件夹，会自动注册为<strong>订阅源</strong>（可添加多个自定义网页站点）：
+              上传/重传即注册或更新，删除文件即移除，可在<strong>订阅源管理</strong>中改名/调序/禁用（zip 解压上传可附带 css/js/图片等相对资源）。
+            </p>
+          </template>
+        </el-alert>
+
         <el-table ref="staticTableRef" :data="staticFiles" border style="width: 100%" v-loading="staticLoading"
                   @row-dblclick="handleRowDblClick" @selection-change="handleSelectionChange">
           <el-table-column type="selection" width="45"/>

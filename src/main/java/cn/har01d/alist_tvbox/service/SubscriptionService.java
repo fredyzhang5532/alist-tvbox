@@ -1434,8 +1434,14 @@ public class SubscriptionService {
                         log.debug("add builtin source {}: {}", source.siteKey(), site);
                     }
                 } else if (source.plugin() != null) {
-                    Map<String, Object> site = buildPluginSite(source.plugin(), embedToken, secret,
-                            playbackToken, configUrl);
+                    Map<String, Object> site;
+                    if (PluginService.isWebPagePlugin(source.plugin())) {
+                        // 自定义网页源(webhome/pages/*.html):csp_WebHome 形态,非 spider 插件站点
+                        site = buildWebPageSite(source.plugin());
+                    } else {
+                        site = buildPluginSite(source.plugin(), embedToken, secret,
+                                playbackToken, configUrl);
+                    }
                     site.put("order", order);
                     String overrideKey = (String) site.get("key");
                     applySiteOverride(overrideKey, site, sites);
@@ -1464,8 +1470,29 @@ public class SubscriptionService {
         // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
         // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
         String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=17";
+        Map<String, Object> site = buildWebHomeLikeSite(WEB_HOME_KEY, name, pageUrl);
+        log.debug("add WebHome site: token={}", homeToken);
+        return site;
+    }
+
+    /**
+     * 自定义网页源站点(static/webhome/pages/*.html 自动注册,名称可在订阅源管理改):
+     * 与内置影视首页同款 csp_WebHome 单形态;页面地址经 /webhome/** no-cache,无需版本号。
+     */
+    private Map<String, Object> buildWebPageSite(Plugin plugin) {
+        String pageUrl = readHostAddress("") + PluginService.webPageUrl(plugin);
+        Map<String, Object> site = buildWebHomeLikeSite(
+                PluginService.webPageSiteKey(plugin),
+                StringUtils.defaultIfBlank(plugin.getName(), "网页"),
+                pageUrl);
+        log.debug("add web page site: {} -> {}", site.get("key"), pageUrl);
+        return site;
+    }
+
+    /** csp_WebHome 站点公共字段(内置影视首页与自定义网页源共用)。 */
+    private Map<String, Object> buildWebHomeLikeSite(String key, String name, String pageUrl) {
         Map<String, Object> site = new HashMap<>();
-        site.put("key", WEB_HOME_KEY);
+        site.put("key", key);
         site.put("name", StringUtils.defaultIfBlank(name, "影视首页"));
         site.put("type", 3);
         site.put("api", "csp_WebHome");
@@ -1483,7 +1510,6 @@ public class SubscriptionService {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("encode WebHome ext failed", e);
         }
-        log.debug("add WebHome site: token={}", homeToken);
         return site;
     }
 
@@ -2201,6 +2227,10 @@ public class SubscriptionService {
 
     /** 插件显示名允许重命名；订阅站点 key 必须使用跨设备稳定的 manifest id。 */
     static String pluginSiteKey(Plugin plugin) {
+        // 自定义网页源:站点目录 key 与下发的 csp_WebHome 站点 key 保持一致(配置编辑器归类为受管源)
+        if (PluginService.isWebPagePlugin(plugin)) {
+            return PluginService.webPageSiteKey(plugin);
+        }
         if (StringUtils.isNotBlank(plugin.getExternalId())) {
             return plugin.getExternalId();
         }

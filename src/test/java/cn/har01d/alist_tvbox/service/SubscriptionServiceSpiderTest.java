@@ -5,6 +5,7 @@ import cn.har01d.alist_tvbox.entity.EmbyRepository;
 import cn.har01d.alist_tvbox.entity.FeiniuRepository;
 import cn.har01d.alist_tvbox.entity.JellyfinRepository;
 import cn.har01d.alist_tvbox.entity.PlaybackTokenRepository;
+import cn.har01d.alist_tvbox.entity.Plugin;
 import cn.har01d.alist_tvbox.entity.DriverAccountRepository;
 import cn.har01d.alist_tvbox.entity.PluginFilterRepository;
 import cn.har01d.alist_tvbox.entity.PluginRepository;
@@ -56,6 +57,28 @@ class SubscriptionServiceSpiderTest {
     /** 订阅源管理里的 WebHome 内置源条目(builtin-atv_home,findEnabledSources 消费形态)。 */
     private static final SubscriptionSourceService.SubscriptionSourceRef WEB_HOME_SOURCE =
             new SubscriptionSourceService.SubscriptionSourceRef("builtin-atv_home", true, "atv_home", "影视首页", null);
+
+    @Test
+    void webPagePluginEmitsWebHomeStyleSite() throws Exception {
+        // 自定义网页源(webhome/pages/*.html 自动注册):csp_WebHome 同款单形态站点,
+        // 中文文件名 key 回落插件 id(web_5),页面地址经 /webhome/** no-cache,无 token/版本号
+        Plugin page = new Plugin();
+        page.setId(5);
+        page.setUrl("/static/webhome/pages/电影库.html");
+        page.setName("我的电影库");
+        SubscriptionService service = newService("{}", mock(WebHomeService.class), List.of(
+                new SubscriptionSourceService.SubscriptionSourceRef("plugin-5", false, "我的电影库", "我的电影库", page)));
+
+        Map<String, Object> config = service.subscription("", "http://up.example/config.json", "", null);
+        Map<String, Object> site = findSite(config, "web_5");
+
+        assertEquals("csp_WebHome", site.get("api"));
+        assertEquals("我的电影库", site.get("name"));
+        assertEquals("http://atv.example/webhome/pages/电影库.html", site.get("homePage"));
+        assertEquals("http://atv.example/spring.jar", site.get("jar"));
+        assertEquals("{\"url\":\"http://atv.example/webhome/pages/电影库.html\"}", site.get("ext"));
+        assertEquals(0, site.get("searchable"));
+    }
 
     @BeforeEach
     void setUp() {
