@@ -1456,7 +1456,7 @@ public class SubscriptionService {
      * WebView 加载 ext 里的同一 URL,注入最小 fm SDK)。同一 URL 同一 token,页面零改动;
      * 能力探测记忆(WebHomeService)不再参与形态选择 —— 同 token 多设备混用(一台 webhtv
      * 把 token 标成能力端,同 token 的原版端曾因此拿到解析不了的原生形态)无法在配置拉取时
-     * 区分客户端,双形态必错一边。ext 为 base64(JSON)(同 csp_Media 宿主透传保底)。
+     * 区分客户端,双形态必错一边。ext 为明文 JSON 字符串(spider 端兼容 base64/裸 URL)。
      * 随订阅源管理(可禁用/调序/改名)下发。
      */
     private Map<String, Object> buildWebHomeSite(String token, String name) {
@@ -1479,7 +1479,7 @@ public class SubscriptionService {
         Map<String, Object> ext = new HashMap<>();
         ext.put("url", pageUrl);
         try {
-            site.put("ext", Base64.getEncoder().encodeToString(objectMapper.writeValueAsString(ext).replaceAll("\\s", "").getBytes()));
+            site.put("ext", objectMapper.writeValueAsString(ext));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("encode WebHome ext failed", e);
         }

@@ -137,9 +137,8 @@ class SubscriptionServiceSpiderTest {
         assertEquals("http://atv.example/webhome/app.html?token=-&v=16", atvHome.get("homePage"));
         // 显式 jar(与其他内置源一致):防宿主不回落全局 spider 或全局位被覆盖
         assertEquals("http://atv.example/spring.jar", atvHome.get("jar"));
-        // ext = base64({"url": 页面地址}),同 csp_Media 字符串 ext 形态(宿主透传保底)
-        String ext = new String(java.util.Base64.getDecoder().decode((String) atvHome.get("ext")));
-        assertEquals("{\"url\":\"http://atv.example/webhome/app.html?token=-&v=16\"}", ext);
+        // ext = 明文 JSON 字符串(spider 端 parseExt 先试明文 JSON,base64 仅兼容回退)
+        assertEquals("{\"url\":\"http://atv.example/webhome/app.html?token=-&v=16\"}", atvHome.get("ext"));
 
         // 普通端(未标记能力):同一形态
         SubscriptionService plain = newService("{}", mock(WebHomeService.class), List.of(WEB_HOME_SOURCE));
