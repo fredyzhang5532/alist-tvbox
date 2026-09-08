@@ -123,8 +123,8 @@ class SubscriptionServiceSpiderTest {
     }
 
     @Test
-    void webHomeSiteInjectedOnlyForCapableClient() {
-        // 能力端(webhtv/fish):订阅源管理已启用 → 注入 homePage 站点,原生 WebHome 直接加载网页
+    void webHomeSiteFollowsClientCapability() {
+        // 能力端(webhtv/fish):订阅源管理已启用 → 原生 homePage 形态,宿主直载页面
         WebHomeService capable = mock(WebHomeService.class);
         when(capable.isCapable(anyString())).thenReturn(true);
         SubscriptionService service = newService("{}", capable, List.of(WEB_HOME_SOURCE));
@@ -134,12 +134,15 @@ class SubscriptionServiceSpiderTest {
         assertEquals("csp_Builtin", sites.get(0).get("api"));
         assertEquals("http://atv.example/webhome/app.html?token=-&v=16", sites.get(0).get("homePage"));
 
-        // 原版 FongMi/OK影视等普通端:订阅源已启用也不注入(能力门禁)
+        // 普通端(原版 FongMi/OK影视等):csp_WebHome spider 形态,spring.jar 全屏 WebView 加载同一页面
         SubscriptionService plain = newService("{}", mock(WebHomeService.class), List.of(WEB_HOME_SOURCE));
         Map<String, Object> config2 = plain.subscription("", "http://up.example/config.json", "", null);
-        for (Map<String, Object> site : (List<Map<String, Object>>) config2.get("sites")) {
-            assertEquals(false, "atv_home".equals(site.get("key")));
-        }
+        Map<String, Object> atvHome = findSite(config2, "atv_home");
+        assertEquals("csp_WebHome", atvHome.get("api"));
+        assertNull(atvHome.get("homePage"));
+        // ext = base64({"url": 页面地址}),同 csp_Media 字符串 ext 形态(宿主透传保底)
+        String ext = new String(java.util.Base64.getDecoder().decode((String) atvHome.get("ext")));
+        assertEquals("{\"url\":\"http://atv.example/webhome/app.html?token=-&v=16\"}", ext);
     }
 
     @Test

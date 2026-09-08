@@ -1404,15 +1404,14 @@ public class SubscriptionService {
             try {
                 if (source.builtin()) {
                     if (WEB_HOME_KEY.equals(source.siteKey())) {
-                        // WebHome 网页首页站(非 spider 站点):独立构建 + 客户端能力门禁,
-                        // 启用/顺序/名称来自订阅源管理;普通端静默跳过(order 顺延无害)
-                        if (webHomeService.isCapable(token)) {
-                            Map<String, Object> site = buildWebHomeSite(token, source.name());
-                            site.put("order", order);
-                            applySiteOverride(WEB_HOME_KEY, site, sites);
-                            sites.add(id++, site);
-                            log.debug("add builtin source {}: {}", source.siteKey(), site);
-                        }
+                        // WebHome 网页首页站:能力端(webhtv/fish)下发原生 homePage 形态,
+                        // 普通端(原版 FongMi/OK影视等)下发 csp_WebHome spider 形态
+                        // (spring.jar 全屏 WebView 加载同一页面);启用/顺序/名称来自订阅源管理
+                        Map<String, Object> site = buildWebHomeSite(token, source.name(), webHomeService.isCapable(token));
+                        site.put("order", order);
+                        applySiteOverride(WEB_HOME_KEY, site, sites);
+                        sites.add(id++, site);
+                        log.debug("add builtin source {}: {}", source.siteKey(), site);
                     } else {
                         Map<String, Object> site = buildSite(embedToken, secret, uid, source.siteKey(), source.name(),
                                 playbackToken, configUrl);
@@ -1451,19 +1450,18 @@ public class SubscriptionService {
     }
 
     /**
-     * WebHome 自定义网页首页站点(webhtv/fish 等魔改端):type 3 + homePage,客户端切到
-     * 该站点首页时加载我们的网页(注入 fm SDK),卡片经 fm.vod 走 csp_Media 原生详情链路。
-     * 随订阅源管理(可禁用/调序/改名)下发;仅对已知支持 WebHome 的客户端 token 注入 ——
-     * 原版 FongMi 解析不了 csp_Builtin,无差别下发会给不支持端留一个死站点。
-     * 能力由 spider 运行时探测回传(见 {@link WebHomeService});首次配好订阅先无此站,
-     * spider 跑过一次后下次刷新配置即出现。
+     * WebHome 自定义网页首页站点,按客户端能力二选一形态(同一 URL 同一 token,页面零改动):
+     * 能力端(webhtv/fish 等原生 WebHome 客户端)= csp_Builtin + homePage,宿主直载页面并注入自家 fm SDK;
+     * 普通端(原版 FongMi/OK影视等) = csp_WebHome + ext,spring.jar spider 全屏 WebView 加载同一页面,
+     * spider 注入最小 fm SDK(vod/history/search 反射宿主 VideoActivity/SearchActivity/History),
+     * 播放仍走宿主原生详情链路(VideoActivity.start(key,id))。ext 为 base64(JSON) 字符串
+     * (同 csp_Media 形态,宿主透传保底)。随订阅源管理(可禁用/调序/改名)下发。
      */
-    private Map<String, Object> buildWebHomeSite(String token, String name) {
+    private Map<String, Object> buildWebHomeSite(String token, String name, boolean capable) {
         Map<String, Object> site = new HashMap<>();
         site.put("key", WEB_HOME_KEY);
         site.put("name", StringUtils.defaultIfBlank(name, "影视首页"));
         site.put("type", 3);
-        site.put("api", "csp_Builtin");
         site.put("searchable", 0);
         site.put("quickSearch", 0);
         site.put("filterable", 0);
@@ -1471,8 +1469,21 @@ public class SubscriptionService {
         // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
         // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
         String homeToken = token.isBlank() ? "-" : token;
-        site.put("homePage", readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=16");
-        log.debug("add WebHome site: token={}", homeToken);
+        String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=16";
+        if (capable) {
+            site.put("api", "csp_Builtin");
+            site.put("homePage", pageUrl);
+        } else {
+            site.put("api", "csp_WebHome");
+            Map<String, Object> ext = new HashMap<>();
+            ext.put("url", pageUrl);
+            try {
+                site.put("ext", Base64.getEncoder().encodeToString(objectMapper.writeValueAsString(ext).replaceAll("\\s", "").getBytes()));
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("encode WebHome ext failed", e);
+            }
+        }
+        log.debug("add WebHome site: token={} capable={}", homeToken, capable);
         return site;
     }
 
