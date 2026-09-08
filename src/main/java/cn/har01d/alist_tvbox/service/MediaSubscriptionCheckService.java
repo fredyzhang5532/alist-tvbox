@@ -1062,7 +1062,7 @@ public class MediaSubscriptionCheckService {
         applyPin(id, resourceId);
         addEvent(id, MediaSubscriptionEvent.TYPE_PINNED,
                 "已钉选主源:" + StringUtils.defaultIfBlank(resource.getTitle(), resource.getLink())
-                        + "(自动换源不再覆盖,取消钉选恢复自动)", false);
+                        + "(强制指定:自动换源与异剧/归属判定不再覆盖,仅链接真死时换走且钉选保留待回归;取消钉选恢复自动)", false);
         activateAsync(uid, id, resourceId);
     }
 
@@ -3124,6 +3124,12 @@ public class MediaSubscriptionCheckService {
                 continue;
             }
             if (!belongsToShow(subscription, resource, files.keySet())) {
+                if (Boolean.TRUE.equals(resource.getPinned())) {
+                    // 钉选豁免归属复核(与主源复核同款):用户否决自动判定,补缺挂载原样保留
+                    log.info("subscription {} pinned aux mount failed ownership recheck, kept (user override): {}",
+                            subscription.getId(), resource.getMountPath());
+                    continue;
+                }
                 // 误挂异剧的补缺/线路挂载:其行会向"本地已有集"冒领错误集号,就地卸载回候选池
                 // (不走 retireResource:链接没死,不进跨订阅黑名单)
                 if (!unmountShareIfUnused(resource.getShareId(), subscription.getId())) {
@@ -3206,6 +3212,13 @@ public class MediaSubscriptionCheckService {
      * (真人版订阅可能正用着它);官方集数修正后冷却期满会重探自愈。
      */
     void retireAlienCandidate(MediaSubscription subscription, MediaSubscriptionResource resource) {
+        if (Boolean.TRUE.equals(resource.getPinned())) {
+            // 钉选是用户否决自动判定的最高信号:任何路径都不把钉选源判异剧退役
+            // (probeShare 门禁已豁免,这里是 activate/补缺等 catch 路径的兜底)
+            log.info("subscription {} pinned resource {} exempt from alien retirement (user override)",
+                    subscription.getId(), resource.getId());
+            return;
+        }
         if (resource.getShareId() != null) {
             // 共享挂载:share 被其它订阅引用时不卸载
             boolean referencedByOthers = subscriptionRepository.existsByShareIdAndIdNot(resource.getShareId(), subscription.getId())
@@ -5059,7 +5072,17 @@ public class MediaSubscriptionCheckService {
             if (files.isEmpty()) {
                 throw new IllegalStateException("资源无可识别的剧集文件:" + resource.getTitle());
             }
+            boolean pinOverride = Boolean.TRUE.equals(resource.getPinned());
             if (episodeNumbersForeign(subscription, files.keySet(), genres)) {
+                if (pinOverride) {
+                    // 钉选 = 用户否决自动判定(与归属复核同款豁免):集号超界多见于官方总数登记滞后,
+                    // 用户钉的源不改判退役 —— 不然钉选→探测→判异剧退役→恢复→再退役死循环
+                    log.info("pinned resource {} skipped alien gate (user override): max episode {}",
+                            resource.getId(), files.lastKey());
+                    addEvent(subscription.getId(), MediaSubscriptionEvent.TYPE_POOL_FILLED,
+                            "钉选源跳过异剧判定(用户强制指定):"
+                                    + StringUtils.defaultIfBlank(resource.getTitle(), resource.getLink()), false);
+                } else {
                 // 同名异剧:就地退役(RETIRED 冷却重探、不拉黑)再抛 —— 四路调用方(fillGaps/主盘/
                 // 线路/升级探测)catch 后按未识别错误(瞬时)跳过,不退役的话每轮都会重复探测它
                 retireAlienCandidate(subscription, resource);
@@ -5067,8 +5090,9 @@ public class MediaSubscriptionCheckService {
                         "候选与剧集不符(" + FOREIGN_SHOW_MARK + ")已跳过:"
                                 + StringUtils.defaultIfBlank(resource.getTitle(), resource.getLink()), false);
                 throw new IllegalStateException(foreignShowReason(subscription, files.lastKey(), resource.getTitle()));
+                }
             }
-            if (episodeDurationForeign(metaRuntimeMinutes(subscription), files.values())) {
+            if (!pinOverride && episodeDurationForeign(metaRuntimeMinutes(subscription), files.values())) {
                 // 单集时长显著不符(真人版 45min vs 动画版 20min):补集号门禁未播完容差内的盲区
                 retireAlienCandidate(subscription, resource);
                 addEvent(subscription.getId(), MediaSubscriptionEvent.TYPE_SOURCE_INVALID,

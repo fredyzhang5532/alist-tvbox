@@ -2117,7 +2117,7 @@ const activateResource = (resource: ResourceDto) => {
 const pinResource = (resource: ResourceDto) => {
   if (!current.value) return
   axios.post(`/api/media-subscriptions/${current.value.id}/resources/${resource.id}/pin`).then(() => {
-    ElMessage.success('已钉选为主源,自动换源不再覆盖')
+    ElMessage.success('已钉选为主源:强制指定,自动换源与异剧判定不再覆盖(仅链接真死时换走,恢复后优先回归)')
     schedule(loadResources, 6000)
     schedule(loadAll, 8000)
   })

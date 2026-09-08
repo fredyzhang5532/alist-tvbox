@@ -4813,6 +4813,61 @@ class MediaSubscriptionCheckServiceTest {
         Mockito.verifyNoInteractions(fixture.deadLinkRepository);
     }
 
+    @Test
+    void probeSharePinnedResourceSkipsAlienGate() {
+        // 钉选 = 用户否决内容判定:37 集文件对官方 26 集(溢出 11 远超容差),未钉选必判异剧退役;
+        // 钉选后探测通过不退役 —— 线上反馈「恢复→钉选→下轮探测再判异剧退役」的钉选形同虚设
+        Fixture fixture = new Fixture();
+        fixture.subscription.setOfficialTotal(26);
+        fixture.subscription.setOfficialEpisodes(26);
+        MediaSubscriptionResource resource = new MediaSubscriptionResource();
+        resource.setId(19);
+        resource.setSubscriptionId(1);
+        resource.setLink("https://pan.baidu.com/s/live37pin");
+        resource.setTitle("仙剑奇侠传三 全37集 2160P");
+        resource.setType(10);
+        resource.setState(MediaSubscriptionResource.STATE_CANDIDATE);
+        resource.setPinned(true);
+        Share temp = new Share();
+        temp.setId(78);
+        temp.setPath("/我的百度分享/temp/baidu@live37pin@");
+        Share probe = new Share();
+        probe.setType(10);
+        probe.setShareId("live37pin");
+        Mockito.when(fixture.shareService.parseShareLink("https://pan.baidu.com/s/live37pin")).thenReturn(probe);
+        Mockito.when(fixture.shareRepository.findByTypeAndShareIdAndTempTrue(10, "live37pin")).thenReturn(List.of(temp));
+        Mockito.when(fixture.aListService.listFiles(Mockito.any(), Mockito.anyString(),
+                        Mockito.anyInt(), Mockito.anyInt(), Mockito.anyBoolean()))
+                .thenReturn(files(s01EpisodeFiles(37)));
+        RowStore store = new RowStore();
+        store.install(fixture);
+        fixture.service.setStreamProbeClient((url, userAgent, maxBytes, timeoutSeconds) ->
+                new StreamProbeClient.ProbeResult(206, "video/mp4", new byte[]{0x1A, 0x45}));
+        Mockito.when(fixture.aListService.getFile(Mockito.any(), Mockito.anyString())).thenReturn(rawUrlDetail());
+
+        fixture.service.probeShare(fixture.subscription, resource); // 不抛:钉选豁免异剧门禁
+
+        assertEquals(MediaSubscriptionResource.STATE_CANDIDATE, resource.getState(), "钉选源不因内容门禁退役");
+        assertNull(resource.getFailKind(), "不落异剧分类");
+        assertTrue(store.episodes.containsKey(37), "钉选源的超范围集号照常入账(用户强制指定)");
+        Mockito.verifyNoInteractions(fixture.deadLinkRepository);
+    }
+
+    @Test
+    void retireAlienCandidateExemptsPinnedResource() {
+        // 兜底闸门:activate/补缺等 catch 路径直接调 retireAlienCandidate 时,钉选源同样豁免
+        Fixture fixture = new Fixture();
+        MediaSubscriptionResource pinned = new MediaSubscriptionResource();
+        pinned.setId(20);
+        pinned.setSubscriptionId(1);
+        pinned.setState(MediaSubscriptionResource.STATE_MOUNTED);
+        pinned.setPinned(true);
+
+        fixture.service.retireAlienCandidate(fixture.subscription, pinned);
+
+        assertEquals(MediaSubscriptionResource.STATE_MOUNTED, pinned.getState(), "钉选源不被判异剧退役");
+    }
+
     // ---------- 元数据信号增强(2026-08-23,用户提议"集数/播出时间/单集长度/类型/演员应帮助判断匹配度")----------
     // 可落地的三路:标题宣称集数(入池即拦,不等挂载探测)、单集时长(补集号门禁未播完容差盲区,
     // 时长是内容属性不受码率影响)、版本词(动画订阅拒显式「真人版」)。年份已有门禁;演员
