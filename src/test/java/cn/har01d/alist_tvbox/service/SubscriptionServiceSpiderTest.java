@@ -39,6 +39,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -76,7 +77,8 @@ class SubscriptionServiceSpiderTest {
         assertEquals("我的电影库", site.get("name"));
         assertEquals("http://atv.example/webhome/pages/电影库.html", site.get("homePage"));
         assertEquals("http://atv.example/spring.jar", site.get("jar"));
-        assertEquals("{\"url\":\"http://atv.example/webhome/pages/电影库.html\"}", site.get("ext"));
+        String pageExt = (String) site.get("ext");
+        assertTrue(pageExt.contains("\"url\":\"http://atv.example/webhome/pages/电影库.html\""));
         assertEquals(0, site.get("searchable"));
     }
 
@@ -160,8 +162,10 @@ class SubscriptionServiceSpiderTest {
         assertEquals("http://atv.example/webhome/app.html?token=-&v=19", atvHome.get("homePage"));
         // 显式 jar(与其他内置源一致):防宿主不回落全局 spider 或全局位被覆盖
         assertEquals("http://atv.example/spring.jar", atvHome.get("jar"));
-        // ext = 明文 JSON 字符串(spider 端 parseExt 先试明文 JSON,base64 仅兼容回退)
-        assertEquals("{\"url\":\"http://atv.example/webhome/app.html?token=-&v=19\"}", atvHome.get("ext"));
+        // ext = 明文 JSON(url + pt 播放同步专用令牌,测试桩下为空;键序不保证,按内容断言)
+        String ext = (String) atvHome.get("ext");
+        assertTrue(ext.contains("\"url\":\"http://atv.example/webhome/app.html?token=-&v=19\""));
+        assertTrue(ext.contains("\"pt\":\"\""));
 
         // 普通端(未标记能力):同一形态
         SubscriptionService plain = newService("{}", mock(WebHomeService.class), List.of(WEB_HOME_SOURCE));

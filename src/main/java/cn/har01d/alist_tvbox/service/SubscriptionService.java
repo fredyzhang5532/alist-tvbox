@@ -1407,7 +1407,7 @@ public class SubscriptionService {
                         // WebHome 网页首页站:单形态通吃(webhtv/fish 按 homePage 字段原生渲染,
                         // 字段驱动与 api 名无关;普通端由 spring.jar csp_WebHome spider 弹窗加载);
                         // 启用/顺序/名称来自订阅源管理
-                        Map<String, Object> site = buildWebHomeSite(token, source.name());
+                        Map<String, Object> site = buildWebHomeSite(token, source.name(), playbackToken);
                         site.put("order", order);
                         applySiteOverride(WEB_HOME_KEY, site, sites);
                         sites.add(id++, site);
@@ -1437,7 +1437,7 @@ public class SubscriptionService {
                     Map<String, Object> site;
                     if (PluginService.isWebPagePlugin(source.plugin())) {
                         // 自定义网页源(webhome/pages/*.html):csp_WebHome 形态,非 spider 插件站点
-                        site = buildWebPageSite(source.plugin());
+                        site = buildWebPageSite(source.plugin(), playbackToken);
                     } else {
                         site = buildPluginSite(source.plugin(), embedToken, secret,
                                 playbackToken, configUrl);
@@ -1465,12 +1465,12 @@ public class SubscriptionService {
      * 区分客户端,双形态必错一边。ext 为明文 JSON 字符串(spider 端兼容 base64/裸 URL)。
      * 随订阅源管理(可禁用/调序/改名)下发。
      */
-    private Map<String, Object> buildWebHomeSite(String token, String name) {
+    private Map<String, Object> buildWebHomeSite(String token, String name, String playbackToken) {
         String homeToken = token.isBlank() ? "-" : token;
         // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
         // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
         String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=19";
-        Map<String, Object> site = buildWebHomeLikeSite(WEB_HOME_KEY, name, pageUrl);
+        Map<String, Object> site = buildWebHomeLikeSite(WEB_HOME_KEY, name, pageUrl, playbackToken);
         log.debug("add WebHome site: token={}", homeToken);
         return site;
     }
@@ -1479,18 +1479,18 @@ public class SubscriptionService {
      * 自定义网页源站点(static/webhome/pages/*.html 自动注册,名称可在订阅源管理改):
      * 与内置影视首页同款 csp_WebHome 单形态;页面地址经 /webhome/** no-cache,无需版本号。
      */
-    private Map<String, Object> buildWebPageSite(Plugin plugin) {
+    private Map<String, Object> buildWebPageSite(Plugin plugin, String playbackToken) {
         String pageUrl = readHostAddress("") + PluginService.webPageUrl(plugin);
         Map<String, Object> site = buildWebHomeLikeSite(
                 PluginService.webPageSiteKey(plugin),
                 StringUtils.defaultIfBlank(plugin.getName(), "网页"),
-                pageUrl);
+                pageUrl, playbackToken);
         log.debug("add web page site: {} -> {}", site.get("key"), pageUrl);
         return site;
     }
 
     /** csp_WebHome 站点公共字段(内置影视首页与自定义网页源共用)。 */
-    private Map<String, Object> buildWebHomeLikeSite(String key, String name, String pageUrl) {
+    private Map<String, Object> buildWebHomeLikeSite(String key, String name, String pageUrl, String playbackToken) {
         Map<String, Object> site = new HashMap<>();
         site.put("key", key);
         site.put("name", StringUtils.defaultIfBlank(name, "影视首页"));
@@ -1505,6 +1505,9 @@ public class SubscriptionService {
         site.put("jar", readHostAddress("") + "/spring.jar");
         Map<String, Object> ext = new HashMap<>();
         ext.put("url", pageUrl);
+        // 播放同步专用令牌(订阅 token 过不了 /api/playback 的 X-PlaySync-Token 鉴权):
+        // spider fm.history 桥的兜底数据源 —— 服务端播放记录(跨设备继续观看)
+        ext.put("pt", StringUtils.defaultString(playbackToken));
         try {
             site.put("ext", objectMapper.writeValueAsString(ext));
         } catch (JsonProcessingException e) {
