@@ -6172,6 +6172,12 @@ public class MediaSubscriptionCheckService {
         }
         String cleaned = TECH_TAGS.matcher(base).replaceAll(" ");
         cleaned = DATE_STAMP.matcher(cleaned).replaceAll(" "); // 日期戳的月/日会被末号规则当成集号
+        // 网盘重名去重尾缀「(1)」(吞噬星空补缺源 217 4K(1).mp4):TECH_TAGS 剥 4K 后剩「217 (1)」,
+        // 末号规则取最后一个数字把 217 号文件绑到第 1 集(显示第 1 集实际播 217)。
+        // 仅当前文已有数字才剥尾缀,纯「(1)」形态(唯一数字在括号内)保持原语义。
+        if (cleaned.matches("(?s).*\\d.*\\(\\s*\\d{1,2}\\s*\\)\\s*$")) {
+            cleaned = cleaned.replaceFirst("\\(\\s*\\d{1,2}\\s*\\)\\s*$", "").trim();
+        }
         int episode = -1;
         Matcher numbers = NUMBER.matcher(cleaned);
         while (numbers.find()) {

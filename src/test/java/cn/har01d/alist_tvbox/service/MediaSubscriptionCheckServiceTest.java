@@ -89,6 +89,15 @@ class MediaSubscriptionCheckServiceTest {
         assertEquals(12, service.parseEpisode("剧名.S02E12.2160p.WEB-DL.mkv", 2));
     }
 
+    /** 网盘重名去重尾缀「(1)」不得毒化末号规则(吞噬星空 217 4K(1).mp4 曾绑到第 1 集)。 */
+    @Test
+    void dedupeParenSuffixDoesNotOverrideEpisode() {
+        assertEquals(217, service.parseEpisode("217 4K(1).mp4", null));
+        assertEquals(86, service.parseEpisode("吞噬星空 86(2).mp4", null));
+        // 括号是唯一数字来源时保持原语义(第 1 集)
+        assertEquals(1, service.parseEpisode("剧集(1).mp4", null));
+    }
+
     // ---------- 进度感知的观看进度(2026-08-27):刚点开几十秒的试看不算看完 ----------
     // 线上形态:33 集只看了几十秒就被算成"看完 33 集",追平标记被试看抬到 33,
     // 用户回看时「还没看完的最后一集」从此不亮角标。当前集进度不足折算前一集。
