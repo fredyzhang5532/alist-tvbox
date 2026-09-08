@@ -44,6 +44,16 @@ class PluginFileSyncServiceTest {
     }
 
     @Test
+    void reconcileCreatesDirectoriesWhenMissing() {
+        // 服务启动(onApplicationReady→reconcile)即自动创建 plugins 与 webhome/pages 目录:
+        // 静态文件页可见、可直接进入上传,无需先手动建目录
+        service.reconcile(staticRoot);
+
+        org.junit.jupiter.api.Assertions.assertTrue(Files.isDirectory(staticRoot.resolve("webhome/pages")));
+        org.junit.jupiter.api.Assertions.assertTrue(Files.isDirectory(staticRoot.resolve("plugins")));
+    }
+
+    @Test
     void htmlUploadRegistersWebPageSource() throws Exception {
         Files.createDirectories(staticRoot.resolve("webhome/pages"));
         Files.writeString(staticRoot.resolve("webhome/pages/电影库.html"), "<html></html>");
