@@ -3,6 +3,7 @@ package cn.har01d.alist_tvbox.service;
 import cn.har01d.alist_tvbox.config.AppProperties;
 import cn.har01d.alist_tvbox.domain.DriverType;
 import cn.har01d.alist_tvbox.domain.Role;
+import cn.har01d.alist_tvbox.dto.SourceKeyUsageCount;
 import cn.har01d.alist_tvbox.dto.TokenDto;
 import cn.har01d.alist_tvbox.entity.Account;
 import cn.har01d.alist_tvbox.entity.AccountRepository;
@@ -12,6 +13,7 @@ import cn.har01d.alist_tvbox.entity.PlaybackTokenRepository;
 import cn.har01d.alist_tvbox.entity.DriverAccountRepository;
 import cn.har01d.alist_tvbox.entity.EmbyRepository;
 import cn.har01d.alist_tvbox.entity.FeiniuRepository;
+import cn.har01d.alist_tvbox.entity.HistoryRepository;
 import cn.har01d.alist_tvbox.entity.JellyfinRepository;
 import cn.har01d.alist_tvbox.entity.Plugin;
 import cn.har01d.alist_tvbox.entity.PluginFilter;
@@ -93,7 +95,7 @@ import static cn.har01d.alist_tvbox.util.Constants.USER_TOKEN_PREFIX;
 public class SubscriptionService {
     private static final String PLUGIN_RUN_MODE = "plugin_run_mode";
     private static final String PLUGIN_RUN_MODE_PYTHON = "python";
-    private static final String ATVP_RUNTIME_REVISION = "local-proxy-v1";
+    private static final String ATVP_RUNTIME_REVISION = "preheat-v1";
     private static final String AUTO_UPDATE_PG = "auto_update_pg";
     private static final String AUTO_UPDATE_ZX = "auto_update_zx";
     private static final String AUTO_UPDATE_XS = "auto_update_xs";
@@ -125,6 +127,7 @@ public class SubscriptionService {
     private final SubscriptionSourceService subscriptionSourceService;
     private final PlaybackTokenRepository playbackTokenRepository;
     private final WebHomeService webHomeService;
+    private final HistoryRepository historyRepository;
 
     private final OkHttpClient okHttpClient = new OkHttpClient();
     private final ThreadLocal<String> currentToken = new ThreadLocal<>();
@@ -158,7 +161,8 @@ public class SubscriptionService {
                                FileDownloader fileDownloader,
                                SubscriptionSourceService subscriptionSourceService,
                                PlaybackTokenRepository playbackTokenRepository,
-                               WebHomeService webHomeService) {
+                               WebHomeService webHomeService,
+                               HistoryRepository historyRepository) {
         this.environment = environment;
         this.appProperties = appProperties;
         this.restTemplate = builder
@@ -186,6 +190,7 @@ public class SubscriptionService {
         this.subscriptionSourceService = subscriptionSourceService;
         this.playbackTokenRepository = playbackTokenRepository;
         this.webHomeService = webHomeService;
+        this.historyRepository = historyRepository;
     }
 
     @PostConstruct
@@ -1708,6 +1713,61 @@ public class SubscriptionService {
         return baseUrl + "/Atvp.py?v=" + ATVP_RUNTIME_REVISION;
     }
 
+    static String preheatManifestUrl(String baseUrl, String token) {
+        return baseUrl + "/plugin-preheat/" + token;
+    }
+
+    /**
+     * 插件预热清单:全部启用插件的密文地址(带版本参数),常用插件排前。
+     * 客户端(spring.jar 与 Atvp.py)冷启动后台按清单预下载密文到本地缓存,
+     * 首次切换站点与全局搜索时免逐个网络下载。必须先经 checkToken 建立请求上下文,
+     * 与 ext 里的 source 地址保持同一 contentToken、同一拼法,客户端缓存才能命中。
+     */
+    public Map<String, Object> buildPreheatManifest() {
+        String baseUrl = readHostAddress("");
+        String contentToken = getCurrentOrFirstToken();
+        List<Plugin> plugins = new ArrayList<>(pluginRepository.findByEnabledTrueOrderBySortOrderAscIdAsc());
+
+        Map<String, Long> usage = new HashMap<>();
+        for (SourceKeyUsageCount count : historyRepository.countBySourceKey("spider_plugin")) {
+            if (count.getSourceKey() != null) {
+                usage.put(count.getSourceKey(), count.getTotal());
+            }
+        }
+        plugins.sort(Comparator
+                .comparingLong((Plugin plugin) -> usage.getOrDefault(pluginSiteKey(plugin), 0L)).reversed()
+                .thenComparing(Plugin::getSortOrder, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(Plugin::getId, Comparator.nullsLast(Comparator.naturalOrder())));
+
+        List<Map<String, Object>> items = new ArrayList<>();
+        for (Plugin plugin : plugins) {
+            Map<String, Object> item = new HashMap<>();
+            item.put("url", pluginContentUrl(baseUrl, contentToken, plugin));
+            item.put("key", pluginSiteKey(plugin));
+            item.put("name", plugin.getName());
+            items.add(item);
+        }
+        Map<String, Object> manifest = new HashMap<>();
+        manifest.put("plugins", items);
+        log.info("built plugin preheat manifest: {} plugins, top={}", items.size(),
+                items.isEmpty() ? "-" : items.get(0).get("key"));
+        return manifest;
+    }
+
+    /**
+     * 插件密文内容地址。version 参数让地址兼作客户端预下载缓存的 key:
+     * 插件更新后版本变化,订阅配置刷新即换地址,旧缓存自然失效。
+     */
+    static String pluginContentUrl(String baseUrl, String token, Plugin plugin) {
+        boolean rawPython = PluginService.isPythonPluginUrl(plugin.getUrl());
+        String extension = rawPython ? ".py" : ".txt";
+        String url = baseUrl + "/plugins/" + token + "/" + plugin.getId() + extension;
+        if (plugin.getVersion() != null) {
+            url += "?v=" + plugin.getVersion();
+        }
+        return url;
+    }
+
     static Map<String, Object> buildPluginExtPayload(Plugin plugin,
                                                      String baseUrl,
                                                      String contentToken,
@@ -1715,12 +1775,10 @@ public class SubscriptionService {
                                                      String secret,
                                                      boolean nativePython,
                                                      Map<String, Object> localProxyConfig) {
-        boolean rawPython = PluginService.isPythonPluginUrl(plugin.getUrl());
         Map<String, Object> map = new HashMap<>();
         map.put("api", baseUrl);
-        String extension = rawPython ? ".py" : ".txt";
-        String contentUrl = baseUrl + "/plugins/" + contentToken + "/" + plugin.getId() + extension;
-        if (rawPython) {
+        String contentUrl = pluginContentUrl(baseUrl, contentToken, plugin);
+        if (PluginService.isPythonPluginUrl(plugin.getUrl())) {
             map.put("loader", atvpUrl(baseUrl));
             map.put("source", contentUrl);
             map.put("raw", true);
@@ -1730,6 +1788,7 @@ public class SubscriptionService {
                 map.put("loader", atvpUrl(baseUrl));
             }
         }
+        map.put("preheatUrl", preheatManifestUrl(baseUrl, contentToken));
         map.put("token", token.isBlank() ? "-" : token);
         map.put("secret", secret);
         map.put("playbackSourceKind", "spider_plugin");
@@ -2185,8 +2244,8 @@ public class SubscriptionService {
                 continue;
             }
             builtinPluginKeys.add(key);
-            // WebHome 首页站仅对能力端(webhtv/fish)随配置注入,普通影视订阅不含此站,
-            // 站点目录(配置编辑器)不返回;key 仍参与去重,用户手写的 atv_home 条目也不进自定义站点列表
+            // WebHome 首页站(atv_home)单形态通吃所有客户端,启用即随 sites 下发,但它是
+            // 网页首页非普通站点条目,进站点编辑目录无意义;key 仍参与去重,用户手写的 atv_home 条目也不进自定义站点列表
             if (WEB_HOME_KEY.equals(key)) {
                 continue;
             }

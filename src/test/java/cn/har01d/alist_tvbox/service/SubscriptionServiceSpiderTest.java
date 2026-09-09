@@ -1,8 +1,10 @@
 package cn.har01d.alist_tvbox.service;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.dto.SourceKeyUsageCount;
 import cn.har01d.alist_tvbox.entity.EmbyRepository;
 import cn.har01d.alist_tvbox.entity.FeiniuRepository;
+import cn.har01d.alist_tvbox.entity.HistoryRepository;
 import cn.har01d.alist_tvbox.entity.JellyfinRepository;
 import cn.har01d.alist_tvbox.entity.PlaybackTokenRepository;
 import cn.har01d.alist_tvbox.entity.Plugin;
@@ -32,6 +34,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -187,6 +190,66 @@ class SubscriptionServiceSpiderTest {
         }
     }
 
+    @Test
+    void preheatManifestPutsFrequentlyUsedPluginsFirst() {
+        PluginRepository pluginRepository = mock(PluginRepository.class);
+        Plugin a = preheatPlugin(1, "ext-a", 10, 4);
+        Plugin b = preheatPlugin(2, "ext-b", 20, null);
+        Plugin c = preheatPlugin(3, "ext-c", 30, 7);
+        when(pluginRepository.findByEnabledTrueOrderBySortOrderAscIdAsc())
+                .thenReturn(new ArrayList<>(List.of(a, b, c)));
+
+        HistoryRepository historyRepository = mock(HistoryRepository.class);
+        when(historyRepository.countBySourceKey("spider_plugin"))
+                .thenReturn(List.of(usage("ext-c", 5), usage("ext-a", 2)));
+
+        SubscriptionService service = newService("{}", mock(WebHomeService.class), List.of(),
+                pluginRepository, historyRepository);
+        Map<String, Object> manifest = service.buildPreheatManifest();
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> plugins = (List<Map<String, Object>>) manifest.get("plugins");
+        assertEquals(3, plugins.size());
+        // 常用(播放记录聚合次数)在前;未用过的保持 sortOrder 原序垫后
+        assertEquals("ext-c", plugins.get(0).get("key"));
+        assertEquals("ext-a", plugins.get(1).get("key"));
+        assertEquals("ext-b", plugins.get(2).get("key"));
+        // 地址与 ext 的 source 同一拼法(缓存命中前提),带 ?v= 版本参数
+        assertEquals("http://atv.example/plugins/-/3.txt?v=7", plugins.get(0).get("url"));
+        assertEquals("http://atv.example/plugins/-/1.txt?v=4", plugins.get(1).get("url"));
+        assertEquals("http://atv.example/plugins/-/2.txt", plugins.get(2).get("url"));
+        assertEquals(
+                SubscriptionService.buildPluginExtPayload(c, "http://atv.example", "-", "", "", false, Map.of())
+                        .get("source"),
+                plugins.get(0).get("url"));
+    }
+
+    private Plugin preheatPlugin(int id, String externalId, int sortOrder, Integer version) {
+        Plugin plugin = new Plugin();
+        plugin.setId(id);
+        plugin.setExternalId(externalId);
+        plugin.setName(externalId);
+        plugin.setUrl("https://example.com/" + externalId + ".txt");
+        plugin.setSortOrder(sortOrder);
+        plugin.setVersion(version);
+        plugin.setEnabled(true);
+        return plugin;
+    }
+
+    private SourceKeyUsageCount usage(String sourceKey, long total) {
+        return new SourceKeyUsageCount() {
+            @Override
+            public String getSourceKey() {
+                return sourceKey;
+            }
+
+            @Override
+            public long getTotal() {
+                return total;
+            }
+        };
+    }
+
     private Map<String, Object> findSite(Map<String, Object> config, String key) {
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
         return sites.stream().filter(s -> key.equals(s.get("key"))).findFirst().orElseThrow();
@@ -202,6 +265,13 @@ class SubscriptionServiceSpiderTest {
 
     private SubscriptionService newService(String upstreamJson, WebHomeService webHomeService,
                                            List<SubscriptionSourceService.SubscriptionSourceRef> sources) {
+        return newService(upstreamJson, webHomeService, sources, mock(PluginRepository.class),
+                mock(HistoryRepository.class));
+    }
+
+    private SubscriptionService newService(String upstreamJson, WebHomeService webHomeService,
+                                           List<SubscriptionSourceService.SubscriptionSourceRef> sources,
+                                           PluginRepository pluginRepository, HistoryRepository historyRepository) {
         SettingRepository settingRepository = mock(SettingRepository.class);
         when(settingRepository.findById(anyString())).thenAnswer(invocation -> {
             Object key = invocation.getArgument(0);
@@ -235,7 +305,7 @@ class SubscriptionServiceSpiderTest {
                 mock(EmbyRepository.class),
                 mock(FeiniuRepository.class),
                 mock(JellyfinRepository.class),
-                mock(PluginRepository.class),
+                pluginRepository,
                 mock(PluginFilterRepository.class),
                 mock(AListLocalService.class),
                 mock(ConfigFileService.class),
@@ -244,7 +314,8 @@ class SubscriptionServiceSpiderTest {
                 mock(FileDownloader.class),
                 subscriptionSourceService,
                 mock(PlaybackTokenRepository.class),
-                webHomeService
+                webHomeService,
+                historyRepository
         );
 
         ReflectionTestUtils.setField(service, "okHttpClient", httpServerReturning(upstreamJson));

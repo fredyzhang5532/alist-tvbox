@@ -225,10 +225,11 @@ class SubscriptionServiceTest {
         assertThat(SubscriptionService.selectPluginApi(plugin, false, "http://atv"))
                 .isEqualTo("csp_PyProxy");
         assertThat(payload)
-                .containsEntry("loader", "http://atv/Atvp.py?v=local-proxy-v1")
+                .containsEntry("loader", "http://atv/Atvp.py?v=preheat-v1")
                 .containsEntry("source", "http://atv/plugins/web/7.py")
                 .containsEntry("raw", true)
                 .containsEntry("api", "http://atv")
+                .containsEntry("preheatUrl", "http://atv/plugin-preheat/web")
                 .containsEntry("playbackSourceKind", "spider_plugin")
                 .containsEntry("playbackSourceKey", "stable-plugin-id")
                 .containsEntry("playbackSourceName", "短剧优选")
@@ -237,6 +238,14 @@ class SubscriptionServiceTest {
                 .containsEntry("data", "{\"site\":\"demo\"}")
                 .containsEntry("local_proxy_config", localProxyConfig);
         assertThat(payload.get("loader")).isNotEqualTo("http://atv/plugins/web/7.py");
+
+        // 有版本号时 source 地址带版本参数:预下载缓存以完整地址为 key,插件更新换地址即失效
+        plugin.setVersion(12);
+        assertThat(SubscriptionService.pluginContentUrl("http://atv", "web", plugin))
+                .isEqualTo("http://atv/plugins/web/7.py?v=12");
+        plugin.setVersion(null);
+        assertThat(SubscriptionService.pluginContentUrl("http://atv", "web", plugin))
+                .isEqualTo("http://atv/plugins/web/7.py");
     }
 
     @Test
@@ -251,7 +260,7 @@ class SubscriptionServiceTest {
                 plugin, "http://atv", "web", "", "secret", true, localProxyConfig);
 
         assertThat(SubscriptionService.selectPluginApi(plugin, true, "http://atv"))
-                .isEqualTo("http://atv/Atvp.py?v=local-proxy-v1");
+                .isEqualTo("http://atv/Atvp.py?v=preheat-v1");
         assertThat(SubscriptionService.selectPluginApi(plugin, false, "http://atv"))
                 .isEqualTo("csp_PyProxy");
         assertThat(payload)
@@ -264,7 +273,7 @@ class SubscriptionServiceTest {
         Map<String, Object> javaPayload = SubscriptionService.buildPluginExtPayload(
                 plugin, "http://atv", "web", "", "secret", false, localProxyConfig);
         assertThat(javaPayload)
-                .containsEntry("loader", "http://atv/Atvp.py?v=local-proxy-v1")
+                .containsEntry("loader", "http://atv/Atvp.py?v=preheat-v1")
                 .containsEntry("local_proxy_config", localProxyConfig);
     }
 
