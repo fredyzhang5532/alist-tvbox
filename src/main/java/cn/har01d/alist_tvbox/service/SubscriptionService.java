@@ -2244,11 +2244,8 @@ public class SubscriptionService {
                 continue;
             }
             builtinPluginKeys.add(key);
-            // WebHome 首页站(atv_home)单形态通吃所有客户端,启用即随 sites 下发,但它是
-            // 网页首页非普通站点条目,进站点编辑目录无意义;key 仍参与去重,用户手写的 atv_home 条目也不进自定义站点列表
-            if (WEB_HOME_KEY.equals(key)) {
-                continue;
-            }
+            // atv_home(影视首页)单形态通吃后即常规站点条目,随目录返回 —— 白名单模式必须可选,
+            // 否则影视首页被订阅级白名单过滤(该订阅看不到首页);key 参与去重,上游手写条目不以 upstream 形态重复
             Map<String, Object> item = new HashMap<>();
             item.put("key", key);
             item.put("name", source.name() == null ? key : source.name());

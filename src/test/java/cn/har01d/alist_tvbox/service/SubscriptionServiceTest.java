@@ -140,7 +140,7 @@ class SubscriptionServiceTest {
 
     @Test
     void buildCatalogTagsUpstreamBuiltinPluginAndMapsPushKey() {
-        // atv_home 为上游手写条目:能力端会被内置站合并覆盖,目录里也不得以自定义站点形态出现
+        // atv_home 为上游手写条目:被内置定义合并,目录里只以 builtin 形态出现一次(不以 upstream 形态重复)
         Map<String, Object> c = config("csp_Bili", "atv_home"); // upstream
         c.put("parses", new ArrayList<>(List.of(parse("虾米"))));
 
@@ -160,8 +160,10 @@ class SubscriptionServiceTest {
 
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> sites = (List<Map<String, Object>>) catalog.get("sites");
-        // WebHome 首页站仅能力端注入,站点目录(普通影视配置编辑器)不返回
-        assertThat(sites).noneSatisfy(s -> assertThat(s).containsEntry("key", "atv_home"));
+        // WebHome 首页站随目录返回(白名单模式须可选),上游手写条目被去重,只出现一次且为 builtin
+        assertThat(sites).filteredOn(s -> "atv_home".equals(s.get("key"))).hasSize(1);
+        assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "atv_home")
+                .containsEntry("name", "影视首页").containsEntry("origin", "builtin"));
         assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "csp_Bili").containsEntry("origin", "upstream"));
         assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "csp_AList").containsEntry("origin", "builtin"));
         assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "push_agent").containsEntry("origin", "builtin"));
