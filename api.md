@@ -13,6 +13,7 @@
 - [媒体集成](#媒体集成)
 - [网盘账户](#网盘账户)
 - [订阅与配置](#订阅与配置)
+- [追剧订阅](#追剧订阅)
 - [系统管理](#系统管理)
 
 ---
@@ -30,6 +31,9 @@
 | GET | `/vod/{token}` | TvBox API（带token）- 分类/搜索/详情 |
 | GET | `/m3u8` | M3U8播放列表（无token）            |
 | GET | `/m3u8/{token}` | M3U8播放列表（带token）            |
+| GET | `/open` | Open API（无token）            |
+| GET | `/open/{token}` | Open API（带token）            |
+| GET | `/node/{token}/{file}` | 获取节点文件                      |
 | GET | `/api/qr-code` | 获取二维码                       |
 | GET | `/tv/device` | 获取设备信息                      |
 | POST | `/tv/action` | 设备操作（同步等）                   |
@@ -45,7 +49,11 @@
 | GET | `/sub/{id}` | 获取订阅配置（无token）              |
 | GET | `/sub/{token}/{id}` | 获取订阅配置（带token）              |
 | GET | `/repo/{id}` | 获取多仓订阅配置（无token）            |
-| GET | `/repo/{token}/{id}` | 获取多仓订阅配置（带token）              |
+| GET | `/repo/{token}/{id}` | 获取多仓订阅配置（带token）            |
+| POST | `/api/cat/sync` | 同步猫影视配置                     |
+| GET | `/api/capabilities` | 获取系统能力列表                    |
+| GET | `/api/basic-auth-credentials` | 获取 Basic Auth 凭据 |
+| POST | `/api/basic-auth-credentials/regenerate` | 重新生成 Basic Auth 凭据 |
 
 ---
 
@@ -159,6 +167,25 @@
 |------|------|------|
 | GET | `/subtitles` | 获取字幕内容 |
 
+### PlaybackSyncController
+多端播放记录同步
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | `/api/playback/event` | 上报单条播放记录（播放同步令牌鉴权） |
+| POST | `/api/playback/events` | 批量上报播放记录（播放同步令牌鉴权） |
+| GET | `/api/playback/changes` | 拉取播放记录变更（播放同步令牌鉴权） |
+| POST | `/api/playback/sync` | WebHTV 兼容播放记录上报（播放同步令牌鉴权） |
+| GET | `/api/playback/sync` | WebHTV 兼容播放记录拉取（播放同步令牌鉴权） |
+| GET | `/api/playback/records` | 分页查询当前用户的同步记录 |
+| GET | `/api/playback/records/-/item` | 获取单条同步记录 |
+| POST | `/api/playback/records/-/delete` | 批量删除同步记录并创建墓碑 |
+| DELETE | `/api/playback/records` | 清空当前用户的同步记录 |
+| POST | `/api/playback/tombstones/-/delete` | 清除播放记录墓碑 |
+| GET | `/api/playback/tokens` | 列出播放同步令牌 |
+| POST | `/api/playback/tokens` | 创建播放同步令牌 |
+| DELETE | `/api/playback/tokens/{id}` | 删除播放同步令牌 |
+
 ---
 
 ## 媒体集成
@@ -175,6 +202,7 @@
 | GET | `/api/bilibili/check` | 检查登录 |
 | POST | `/api/bilibili/checkin` | 签到 |
 | POST | `/api/bilibili/cookie` | 更新Cookie |
+| POST | `/api/bilibili/refresh` | 刷新Cookie |
 | POST | `/api/bilibili/login` | 扫码登录 |
 
 ### EmbyController
@@ -242,12 +270,12 @@ Telegram集成
 
 | 方法 | 路径 | 描述 |
 |------|------|------|
-| POST | `/api/telegram/reset` | 重置Telegram |
-| POST | `/api/telegram/login` | 登录Telegram |
-| POST | `/api/telegram/logout` | 登出Telegram |
 | GET | `/api/telegram/search` | 搜索消息 |
+| GET | `/api/telegram/tg-search/health` | 获取 tg-search 服务健康状态 |
 | GET | `/tg-search` | Telegram搜索API（无token） |
 | GET | `/tg-search/{token}` | Telegram搜索API（带token） |
+| GET | `/tgsc` | tg-search 兼容 API（无 token） |
+| GET | `/tgsc/{token}` | tg-search 兼容 API（带 token） |
 | GET | `/tg-db` | Telegram豆瓣API（无token） |
 | GET | `/tg-db/{token}` | Telegram豆瓣API（带token） |
 | GET | `/tgsz` | 搜索ZX格式 |
@@ -255,8 +283,6 @@ Telegram集成
 | POST | `/tgs` | 搜索PG格式（POST） |
 | GET | `/tgs/s/{id}` | 搜索Web（GET） |
 | POST | `/tgs/s/{id}` | 搜索Web（POST） |
-| GET | `/api/telegram/user` | 获取Telegram用户 |
-| GET | `/api/telegram/chats` | 获取所有聊天 |
 | GET | `/api/telegram/channels` | 列出频道 |
 | POST | `/api/telegram/resolveUsername` | 解析用户名 |
 | POST | `/api/telegram/channels` | 保存频道 |
@@ -264,7 +290,31 @@ Telegram集成
 | DELETE | `/api/telegram/channels/{id}` | 删除频道 |
 | POST | `/api/telegram/reloadChannels` | 重新加载频道 |
 | POST | `/api/telegram/validateChannels` | 验证频道 |
-| GET | `/api/telegram/history` | 获取聊天历史 |
+
+### QqMusicController
+QQ 音乐扫码登录
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | `/api/qqmusic/login` | 获取 QQ 或微信登录二维码（参数：`type`） |
+| GET | `/api/qqmusic/check` | 查询扫码登录状态（参数：`key`） |
+| POST | `/api/qqmusic/refresh` | 刷新所有 QQ 音乐插件凭据 |
+
+### PianDanController
+片单导航与搜索
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/pian-dan` | 片单 API（无 token） |
+| GET | `/pian-dan/{token}` | 片单 API（带 token），支持分类、筛选、搜索及详情 |
+
+### MediaLibraryController
+内置“我的追剧”媒体库
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/media` | 我的追剧媒体库（无 token） |
+| GET | `/media/{token}` | 我的追剧媒体库（带 token），支持分类、搜索、详情和播放列表 |
 
 ### LiveController
 直播集成
@@ -275,6 +325,40 @@ Telegram集成
 | GET | `/live/{token}` | 直播API（带token） |
 | GET | `/live-play` | 直播播放（无token） |
 | GET | `/live-play/{token}` | 直播播放（带token） |
+| GET | `/live-proxy` | 直播流代理（无 token） |
+| GET | `/live-proxy/{token}` | 直播流代理（带 token） |
+| POST | `/live/follow` | 关注直播间（无 token） |
+| POST | `/live/{token}/follow` | 关注直播间（带 token） |
+| POST | `/live/unfollow` | 取消关注直播间（无 token） |
+| POST | `/live/{token}/unfollow` | 取消关注直播间（带 token） |
+
+### LiveDanmakuController
+直播弹幕轮询
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/live/danmaku` | 拉取直播弹幕（参数：`platform`、`roomId`、`after`） |
+| GET | `/live/danmaku/{token}` | 拉取直播弹幕（带 token） |
+
+### LiveFollowController
+直播关注管理（登录会话鉴权，数据按当前用户隔离）
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/live/follows` | 列出已关注直播间 |
+| POST | `/api/live/follows` | 关注直播间 |
+| POST | `/api/live/follows/url` | 通过官方直播间地址关注 |
+| DELETE | `/api/live/follows` | 取消关注（参数：`platform`、`roomId`） |
+
+### LiveCookieController
+直播平台 Cookie 管理
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/live/cookies` | 列出直播平台 Cookie 配置 |
+| PUT | `/api/live/cookies` | 保存直播平台 Cookie |
+| DELETE | `/api/live/cookies` | 清除直播平台 Cookie（参数：`platform`） |
+| POST | `/api/live/cookies/verify` | 验证直播平台 Cookie |
 
 ### HuyaController
 虎牙直播集成
@@ -283,6 +367,23 @@ Telegram集成
 |------|------|------|
 | GET | `/huya` | 虎牙API（无token） |
 | GET | `/huya/{token}` | 虎牙API（带token） |
+
+### FeiniuController
+飞牛影视集成
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/feiniu` | 列出飞牛服务器 |
+| POST | `/api/feiniu` | 创建飞牛服务器 |
+| GET | `/api/feiniu/{id}` | 获取飞牛服务器 |
+| POST | `/api/feiniu/{id}` | 更新飞牛服务器 |
+| DELETE | `/api/feiniu/{id}` | 删除飞牛服务器 |
+| GET | `/feiniu` | 飞牛API（无token）- 浏览/搜索/详情 |
+| GET | `/feiniu/{token}` | 飞牛API（带token） |
+| GET | `/feiniu-play` | 飞牛播放（无token） |
+| GET | `/feiniu-play/{token}` | 飞牛播放（带token） |
+| REQUEST | `/feiniu-proxy/{token}` | 飞牛代理 |
+| REQUEST | `/feiniu-img/{token}` | 飞牛图片代理 |
 
 ---
 
@@ -295,6 +396,7 @@ Telegram集成
 |------|------|------|
 | GET | `/api/ali/accounts` | 列出阿里账户 |
 | POST | `/api/ali/accounts` | 创建阿里账户 |
+| POST | `/api/ali/accounts/-/info` | 获取阿里账户信息 |
 | POST | `/api/ali/accounts/{id}/checkin` | 签到 |
 | GET | `/api/ali/accounts/{id}/checkin` | 获取签到日志 |
 | POST | `/api/ali/accounts/{id}/token` | 更新令牌 |
@@ -325,6 +427,14 @@ Telegram集成
 | POST | `/api/pan/accounts/-/token` | 获取刷新令牌 |
 | POST | `/api/pan/accounts/-/info` | 获取账户信息 |
 
+### DriveController
+网盘资源浏览（`Authorization` 鉴权）
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | `/api/drive/resolve` | 解析网盘分享资源 |
+| GET | `/api/drive/{resourceId}/files` | 列出资源目录文件（可选参数：`dir`） |
+
 ### PikPakController
 PikPak网盘
 
@@ -345,17 +455,66 @@ PikPak网盘
 | GET | `/api/pan115/result` | 获取115结果 |
 
 ### OfflineDownloadController
-115/迅雷云盘离线下载
+115/光鸭/迅雷云盘离线下载
 
 | 方法 | 路径 | 描述 |
 |------|------|------|
 | GET | `/api/offline_download/config` | 获取离线下载配置 |
 | POST | `/api/offline_download/config` | 保存离线下载配置 |
-| POST | `/api/offline_download` | 提交115或迅雷云盘离线下载并同步返回播放列表 |
+| GET | `/api/offline_download/quota` | 获取网盘配额 |
+
+### PublicOfflineDownloadController
+离线下载（客户端API）
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | `/offline_download` | 提交离线下载（无token） |
+| POST | `/offline_download/{token}` | 提交离线下载（带token） |
 
 ---
 
 ## 订阅与配置
+
+### 追剧订阅
+
+#### MediaSubscriptionController
+追剧订阅（自动追更）管理。所有接口均要求登录会话鉴权（`ADMIN`/`USER`），数据按当前用户隔离。
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/media-subscriptions` | 列出追剧订阅 |
+| POST | `/api/media-subscriptions` | 创建订阅并异步首次检查 |
+| POST | `/api/media-subscriptions/{id}` | 更新订阅 |
+| DELETE | `/api/media-subscriptions/{id}` | 删除订阅 |
+| POST | `/api/media-subscriptions/{id}/check` | 异步手动检查更新 |
+| POST | `/api/media-subscriptions/{id}/refresh-meta` | 异步刷新媒体元数据 |
+| POST | `/api/media-subscriptions/{id}/check-update` | 异步检查官方播出与本地资源差异 |
+| POST | `/api/media-subscriptions/{id}/pause` | 暂停订阅 |
+| POST | `/api/media-subscriptions/{id}/resume` | 恢复订阅 |
+| GET | `/api/media-subscriptions/{id}/events` | 获取订阅事件时间线 |
+| GET | `/api/media-subscriptions/{id}/resources` | 获取候选资源池 |
+| POST | `/api/media-subscriptions/{id}/resources/{resourceId}/activate` | 异步启用候选资源为主源 |
+| POST | `/api/media-subscriptions/{id}/resources/{resourceId}/pin` | 钉选资源为主源并优先保留 |
+| POST | `/api/media-subscriptions/{id}/resources/{resourceId}/unpin` | 取消资源钉选 |
+| POST | `/api/media-subscriptions/{id}/transfer` | 异步手动转存增量资源 |
+| GET | `/api/media-subscriptions/{id}/transfer/progress` | 获取转存进度 |
+| GET | `/api/media-subscriptions/{id}/next-season` | 查询可订阅的下一季 |
+| GET | `/api/media-subscriptions/{id}/episodes` | 获取分集及本地资源状态 |
+| GET | `/api/media-subscriptions/{id}/detail` | 获取媒体详情、元数据快照及分集信息 |
+| GET | `/api/media-subscriptions/navigation` | 获取片单追更导航分类 |
+| GET | `/api/media-subscriptions/navigation/list` | 获取片单分类条目（参数：`t`、`pg`、`size` 及筛选条件） |
+| GET | `/api/media-subscriptions/schedule` | 获取昨天至未来 7 天的播出时间轴 |
+| GET | `/api/media-subscriptions/meta/resolve` | 解析媒体链接元数据（参数：`url`） |
+| GET | `/api/media-subscriptions/meta/search` | 搜索媒体元数据（参数：`keyword`、`provider`） |
+| POST | `/api/media-subscriptions/preview` | 预览资源搜索与评分，不创建订阅 |
+| GET | `/api/media-subscriptions/inbox` | 获取近 3 天更新、换源和补缺事件 |
+| GET | `/api/media-subscriptions/export` | 导出当前用户的订阅 |
+| POST | `/api/media-subscriptions/import` | 导入订阅 |
+| POST | `/api/media-subscriptions/batch` | 批量检查、暂停、恢复或删除订阅 |
+| GET | `/api/media-subscriptions/stats` | 获取订阅状态与今日更新统计 |
+| POST | `/api/media-subscriptions/follow` | 将当前搜索资源直接订阅为主源 |
+| GET | `/api/media-subscriptions/preference` | 获取当前用户的追剧偏好配置 |
+| POST | `/api/media-subscriptions/preference` | 保存当前用户的追剧偏好配置 |
 
 ### SubscriptionController
 订阅配置管理
@@ -365,6 +524,15 @@ PikPak网盘
 | POST | `/api/subscriptions` | 保存订阅 |
 | GET | `/api/subscriptions` | 列出所有订阅 |
 | DELETE | `/api/subscriptions/{id}` | 删除订阅 |
+
+### SubscriptionSourceController
+订阅源管理
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/subscription-sources` | 列出所有订阅源 |
+| PUT | `/api/subscription-sources/{id}` | 更新订阅源 |
+| POST | `/api/subscription-sources/reorder` | 调整订阅源顺序 |
 
 ### IndexController
 索引管理
@@ -462,7 +630,8 @@ AList别名管理
 
 | 方法 | 路径 | 描述 |
 |------|------|------|
-| GET | `/parse` | 解析URL |
+| POST | `/parse` | 解析URL（无token） |
+| POST | `/parse/{token}` | 解析URL（带token） |
 
 ### RemoteSearchController
 远程搜索
@@ -470,8 +639,13 @@ AList别名管理
 | 方法 | 路径 | 描述 |
 |------|------|------|
 | GET | `/api/pansou` | 获取盘搜信息 |
+| POST | `/api/pansou/check/links` | 检测分享链接有效性 |
+| POST | `/check-links` | 检测网盘链接有效性（无token） |
+| POST | `/check-links/{token}` | 检测网盘链接有效性（插件用，带token，disk_type可省略自动推断） |
 | GET | `/pansou` | 盘搜API（无token） |
 | GET | `/pansou/{token}` | 盘搜API（带token） |
+| GET | `/pansou-group` | 按网盘分组的盘搜 API（无 token） |
+| GET | `/pansou-group/{token}` | 按网盘分组的盘搜 API（带 token） |
 | GET | `/tgsp` | 搜索PG（GET） |
 | POST | `/tgsp` | 搜索PG（POST） |
 | POST | `/tgsp/s/{id}` | 搜索PG频道 |
@@ -491,6 +665,55 @@ PG令牌管理
 |------|------|------|
 | GET | `/pg/version` | 获取PG版本 |
 | GET | `/pg/lib/tokenm` | 获取PG令牌 |
+
+### PluginController
+Python爬虫插件管理
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/plugins` | 列出所有插件 |
+| POST | `/api/plugins` | 创建插件 |
+| POST | `/api/plugins/import` | 导入插件 |
+| PUT | `/api/plugins/{id}` | 更新插件 |
+| POST | `/api/plugins/{id}/refresh` | 刷新插件 |
+| POST | `/api/plugins/reorder` | 调整插件顺序 |
+| DELETE | `/api/plugins/{id}` | 删除插件 |
+| POST | `/api/plugins/delete-batch` | 批量删除插件 |
+
+### PluginContentController
+插件内容访问
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/plugins/{token}/{id}.txt` | 获取插件内容 |
+
+### PluginFilterController
+插件过滤器管理
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/plugin-filters` | 列出所有过滤器 |
+| POST | `/api/plugin-filters` | 创建过滤器 |
+| PUT | `/api/plugin-filters/{id}` | 更新过滤器 |
+| POST | `/api/plugin-filters/{id}/refresh` | 刷新过滤器 |
+| GET | `/api/plugin-filters/{id}/config-schema` | 获取过滤器配置结构 |
+| POST | `/api/plugin-filters/reorder` | 调整过滤器顺序 |
+| DELETE | `/api/plugin-filters/{id}` | 删除过滤器 |
+| POST | `/api/plugin-filters/delete-batch` | 批量删除过滤器 |
+
+### PluginFilterContentController
+过滤器内容访问
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/plugin-filters/{token}/{id}.py` | 获取过滤器内容 |
+
+### TvFanController
+TVFan配置
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/tvfan/config` | 获取TVFan配置 |
 
 ---
 
@@ -549,15 +772,16 @@ PG令牌管理
 
 ## 统计信息
 
-- **总Controller数量**: 40
-- **总API端点数量**: 约 300+
+- **总Controller数量**: 45
+- **总API端点数量**: 约 350+
 
 ---
 
 ## 备注
 
 1. 大部分 TvBox 客户端 API 支持无 token 和带 token 两种访问方式
-2. `/vod`、`/bilibili`、`/emby`、`/jellyfin`、`/live`、`/huya` 等接口支持统一的分类/搜索/详情查询模式
+2. `/vod`、`/bilibili`、`/emby`、`/jellyfin`、`/feiniu`、`/live`、`/huya` 等接口支持统一的分类/搜索/详情查询模式
 3. 带有 `{token}` 路径变量的端点会进行订阅令牌验证
 4. 分页接口支持 `Pageable` 参数（page, size, sort）
 5. 文件上传接口使用 `MultipartFile` 参数
+6. 插件和过滤器支持 Python 爬虫扩展

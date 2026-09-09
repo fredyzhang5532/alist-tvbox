@@ -5,6 +5,7 @@ import cn.har01d.alist_tvbox.domain.TaskResult;
 import cn.har01d.alist_tvbox.domain.TaskStatus;
 import cn.har01d.alist_tvbox.dto.MetaDto;
 import cn.har01d.alist_tvbox.dto.Versions;
+import cn.har01d.alist_tvbox.dto.MovieDiffPayload;
 import cn.har01d.alist_tvbox.entity.Alias;
 import cn.har01d.alist_tvbox.entity.AliasRepository;
 import cn.har01d.alist_tvbox.entity.Meta;
@@ -19,9 +20,11 @@ import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.exception.NotFoundException;
 import cn.har01d.alist_tvbox.tvbox.MovieDetail;
 import cn.har01d.alist_tvbox.util.Constants;
+import cn.har01d.alist_tvbox.util.H2SqlConverter;
 import cn.har01d.alist_tvbox.util.TextUtils;
 import cn.har01d.alist_tvbox.util.Utils;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -34,15 +37,16 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.env.Environment;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpHeaders;
+import org.springframework.jdbc.BadSqlGrammarException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Async;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
@@ -56,12 +60,17 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.time.Instant;
+import java.io.IOException;
+import java.util.TreeSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static cn.har01d.alist_tvbox.util.Constants.MOVIE_VERSION;
@@ -70,12 +79,19 @@ import static cn.har01d.alist_tvbox.util.Constants.USER_AGENT;
 @Slf4j
 @Service
 public class DoubanService {
+    private static final int BATCH_SIZE = 1000;
+    /** diff 文件失败重试上限(整个文件重放,DELETE+INSERT 幂等)。 */
+    private static final int MAX_DIFF_ATTEMPTS = 3;
+    private static final String DIFF_SUCCESS = "SUCCESS";
+    private static final String DIFF_FAILED = "FAILED";
     private static final Pattern NUMBER = Pattern.compile("Season (\\d{1,2})");
     private static final Pattern NUMBER2 = Pattern.compile("SE(\\d{1,2})");
     private static final Pattern NUMBER3 = Pattern.compile("^S(\\d{1,2})$");
     private static final Pattern NUMBER1 = Pattern.compile("第(\\d{1,2})季");
     private static final Pattern YEAR_PATTERN = Pattern.compile("\\((\\d{4})\\)");
     private static final Pattern YEAR2_PATTERN = Pattern.compile("(\\d{4})");
+    // matches a whole string that is only a season marker (第一季, 第3季, Season 1, S01)
+    private static final Pattern SEASON_ONLY = Pattern.compile("^第[0-9一二三四五六七八九十百零两]+季$|^Season\\s+\\d{1,2}$|^S\\d{1,2}$|^SE\\d{1,2}$");
     private static final String DB_PREFIX = "https://movie.douban.com/subject/";
     private static final String[] tokens = new String[]{"导演:", "编剧:", "主演:", "类型:", "制片国家/地区:", "语言:", "上映日期:",
             "片长:", "又名:", "IMDb链接:", "官方网站:", "官方小站:", "首播:", "季数:", "集数:", "单集片长:"};
@@ -88,11 +104,14 @@ public class DoubanService {
     private final SiteService siteService;
     private final TaskService taskService;
     private final FileDownloader fileDownloader;
+    private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     private final RestTemplate restTemplate;
     private final JdbcTemplate jdbcTemplate;
     private final Environment environment;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    /** 瞬态失败重试的退避基数:第 n 次失败后等 base*n 再重试(5s/10s);实例字段仅供测试清零。 */
+    private long diffRetryBackoffMs = 5_000;
     private final OkHttpClient client = new OkHttpClient();
 
     private volatile boolean downloading;
@@ -127,19 +146,27 @@ public class DoubanService {
     @PostConstruct
     public void setup() {
         try {
-            Path path = Utils.getDataPath("atv", "movie_version");
-            if (Files.exists(path)) {
-                List<String> lines = Files.readAllLines(path);
-                if (!lines.isEmpty()) {
-                    settingRepository.save(new Setting(MOVIE_VERSION, lines.get(0).trim()));
+            // 仅首次启动(Setting 缺失)才从 movie_version 文件播种版本 —— 文件在下载 diff.zip 时
+            // 就被 zip 内的 movie_version 覆盖(先于 apply),无条件回写会把「已下载未应用」永久跳过:
+            // apply 失败/中断/库回滚后,版本号被文件顶到高位,缺的 sql 文件永不补放(线上 1317-1339 整批丢失实证)。
+            if (settingRepository.findById(MOVIE_VERSION).isEmpty()) {
+                Path path = Utils.getDataPath("atv", "movie_version");
+                if (Files.exists(path)) {
+                    List<String> lines = Files.readAllLines(path);
+                    if (!lines.isEmpty()) {
+                        settingRepository.save(new Setting(MOVIE_VERSION, lines.get(0).trim()));
+                    }
                 }
             }
         } catch (Exception e) {
             log.warn("", e);
         }
 
+        // init-xiaoya.sh 在基线升级时解包 data.zip 重灌基线并把镜像的 base_version 拷到 /data/atv/:
+        // 标记存在=基线刚被重灌 → 版本号回到基线、中和 data.sql、清空 movie_diff 让全部 diff 重放。
+        // (曾误读 /tmp/base_version,无人写该路径,分支从不触发 —— 存量部署的破坏性 data.sql 因此每启重放。)
         if (metaRepository.count() > 10000) {
-            Path source = Path.of("/tmp/base_version");
+            Path source = Utils.getDataPath("atv", "base_version");
             if (Files.exists(source)) {
                 try {
                     settingRepository.save(new Setting(MOVIE_VERSION, Files.readString(source).trim()));
@@ -153,13 +180,61 @@ public class DoubanService {
                     log.warn("", e);
                 }
 
-                log.debug("reset data.sql");
-                writeText("data.sql", "SELECT COUNT(*) FROM META;");
+                log.info("movie base restored, reset data.sql and clear movie_diff for full replay");
+                writeText("data.sql", "SELECT 1;");
+                try {
+                    jdbcTemplate.update("DELETE FROM movie_diff");
+                } catch (Exception e) {
+                    log.warn("clear movie_diff after base restore failed", e);
+                }
             }
         }
 
+        neutralizeBaseDataScript();
+
         fixMetaId();
         runCmd();
+        // 重试预算按「进程生命周期」计:重启即清零 FAILED 行的 attempts,让升级后的构建能补放
+        // 此前 3/3 卡死的版本(线上 1341.1923/1342.2033);持续失败的文件每启动最多再试 3 次,开销有界。
+        try {
+            jdbcTemplate.update("UPDATE movie_diff SET attempts = 0 WHERE status = ?", DIFF_FAILED);
+        } catch (Exception e) {
+            log.warn("reset failed movie_diff attempts on startup", e);
+        }
+        // 开机自检:补放 movie_diff 无记录(历史缺口/新文件)或 FAILED 未达重试上限的 diff 文件。
+        // 表启用前放过的文件也没有记录 → 首次开机会整体重放一遍(DELETE+INSERT 幂等),顺带修复历史缺口。
+        if (Files.exists(Utils.getDataPath("atv", "sql"))) {
+            executor.execute(this::applyPendingDiffFiles);
+        }
+    }
+
+    /**
+     * 中和 xiaoya 基础数据脚本:spring.sql.init 每次启动都执行 data.sql,而它是
+     * DROP+CREATE 全量还原 —— 每次重启把 MOVIE/META 打回基线,diff 行全灭
+     * (线上「diff 应用成功后行消失」「重启后元数据丢失」两个形态的共同根因)。
+     * 基线已载入(库里有数据)就把 data.sql 改写为空操作,后续重启不再破坏;
+     * 本次已被抹掉的行,由清空 movie_diff 让全部 diff 重放来恢复(它们本就是基线之上的增量)。
+     * 要重新灌基线:放回全量 data.sql 并清空 movie_diff。
+     */
+    private void neutralizeBaseDataScript() {
+        try {
+            Path dataSql = Utils.getDataPath("atv", "data.sql");
+            if (!Files.exists(dataSql) || movieRepository.count() < 10000) {
+                return;
+            }
+            String firstLine;
+            try (var reader = Files.newBufferedReader(dataSql)) {
+                firstLine = reader.readLine();
+            }
+            if (firstLine == null || !firstLine.startsWith("DROP TABLE")) {
+                return;
+            }
+            writeText("data.sql", "SELECT 1;");
+            jdbcTemplate.update("DELETE FROM movie_diff");
+            log.info("neutralized base data.sql (was a destructive full restore) and cleared movie_diff for full replay");
+        } catch (Exception e) {
+            log.warn("neutralize base data.sql failed", e);
+        }
     }
 
     private void runCmd() {
@@ -210,23 +285,20 @@ public class DoubanService {
         return list.size();
     }
 
-    @Scheduled(cron = "0 0 20,22 * * ?")
     public void update() {
         getRemoteVersion(new Versions());
     }
 
     public String getRemoteVersion(Versions versions) {
-        if (!environment.matchesProfiles("xiaoya")) {
-            return "";
-        }
-
         try {
             String remote = restTemplate.getForObject("https://d.har01d.cn/movie_version", String.class).trim();
             versions.setMovie(remote);
             String local = settingRepository.findById(MOVIE_VERSION).map(Setting::getValue).orElse("0.0").trim();
             String cached = getCachedVersion();
             versions.setCachedMovie(cached);
-            if (!local.equals(remote) && !remote.equals(cached) && !downloading) {
+            // 不再要求 remote != cached:cached 文件只代表「已下载」,local(Setting)才代表「已应用」。
+            // apply 失败后 local<remote 而 cached==remote,若按 cached 跳过会永久漏放(重复下载仅 48KB,可接受)。
+            if (!local.equals(remote) && !downloading) {
                 log.info("local: {} cached: {} remote: {}", local, cached, remote);
                 executor.execute(() -> upgradeMovieData(local, remote));
             } else {
@@ -258,7 +330,7 @@ public class DoubanService {
             Task task = fileDownloader.runTask("movie", remote);
             if (taskService.waitTaskFinish(task.getId(), 60)) {
                 log.info("movie data downloaded");
-                getSqlFiles(local).forEach(this::upgradeSqlFile);
+                applyPendingDiffFiles();
             } else {
                 log.warn("download movie data failed");
             }
@@ -269,11 +341,74 @@ public class DoubanService {
         }
     }
 
-    private Stream<Path> getSqlFiles(String version) throws IOException {
-        double local = Double.parseDouble(version);
-        return Files.list(Utils.getDataPath("atv", "sql"))
-                .filter(e -> Double.compare(getVersionNumber(e), local) > 0)
-                .sorted((a, b) -> Double.compare(getVersionNumber(a), getVersionNumber(b)));
+    /** 应用待执行的 diff 文件:movie_diff 表为「已应用」事实来源 —— 无记录(新文件或历史缺口)、
+     *  或 FAILED 且尝试不足 {@link #MAX_DIFF_ATTEMPTS} 才执行,SUCCESS 跳过。同一版本 json/sql 并存时
+     *  JSON 优先(方言无关、JPA 落库);按版本升序,成功推进版本号。 */
+    private void applyPendingDiffFiles() {
+        Map<Double, Path> jsonFiles = diffFiles("json", ".json");
+        Map<Double, Path> sqlFiles = diffFiles("sql", ".sql");
+        TreeSet<Double> versions = new TreeSet<>(jsonFiles.keySet());
+        versions.addAll(sqlFiles.keySet());
+        for (Double version : versions) {
+            String name = String.valueOf(version);
+            if (!needsApply(name)) {
+                continue;
+            }
+            applyDiff(name, jsonFiles.get(version), sqlFiles.get(version));
+        }
+    }
+
+    /** atv/{dir} 下 {version}{suffix} 文件 → 版本号映射;目录缺失返回空。 */
+    private Map<Double, Path> diffFiles(String dir, String suffix) {
+        Map<Double, Path> result = new HashMap<>();
+        try (Stream<Path> files = Files.list(Utils.getDataPath("atv", dir))) {
+            files.filter(Files::isRegularFile)
+                    .filter(e -> e.getFileName().toString().endsWith(suffix))
+                    .forEach(e -> {
+                        try {
+                            result.put(getVersionNumber(e), e);
+                        } catch (NumberFormatException ignored) {
+                            log.debug("ignore non-versioned diff file: {}", e);
+                        }
+                    });
+        } catch (Exception e) {
+            log.debug("list atv/{} failed: {}", dir, e.getMessage());
+        }
+        return result;
+    }
+
+    /** 无记录 → 执行(新文件 + 表启用前已放过的历史文件,自动补放缺口);FAILED 且尝试<上限 → 重试;SUCCESS → 跳过。 */
+    private boolean needsApply(String version) {
+        try {
+            Integer attempts = diffAttempts(version);
+            if (attempts == null) {
+                return true;
+            }
+            String status = jdbcTemplate.queryForObject(
+                    "SELECT status FROM movie_diff WHERE version = ?", String.class, version);
+            return !DIFF_SUCCESS.equals(status) && attempts < MAX_DIFF_ATTEMPTS;
+        } catch (Exception e) {
+            log.debug("query movie_diff for {} failed, treat as pending: {}", version, e.getMessage());
+            return true;
+        }
+    }
+
+    /** 文件当前已尝试次数;无记录返回 null。 */
+    private Integer diffAttempts(String version) {
+        List<Integer> attempts = jdbcTemplate.queryForList(
+                "SELECT attempts FROM movie_diff WHERE version = ?", Integer.class, version);
+        return attempts.isEmpty() ? null : attempts.get(0);
+    }
+
+    private void recordDiff(String version, boolean success, int statements, int failed, int attempts) {
+        try {
+            jdbcTemplate.update("DELETE FROM movie_diff WHERE version = ?", version);
+            jdbcTemplate.update("INSERT INTO movie_diff (version, status, statements, failed, attempts, updated_time) "
+                    + "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)", version,
+                    success ? DIFF_SUCCESS : DIFF_FAILED, statements, failed, attempts);
+        } catch (Exception e) {
+            log.warn("record movie_diff {} failed", version, e);
+        }
     }
 
     private double getVersionNumber(Path path) {
@@ -286,38 +421,258 @@ public class DoubanService {
         return name.substring(0, index);
     }
 
-    private void upgradeSqlFile(Path file) {
+    private void applyDiff(String version, Path json, Path sql) {
+        Integer previous = diffAttempts(version);
+        int attempts = previous == null ? 0 : previous;
+        int applied = 0;
+        int failed = 0;
+        // 失败重试:整个文件重放(upsert 幂等),累计尝试不超过上限。瞬态失败(锁竞争/乐观锁竞态)
+        // 按退避间隔重试 —— 次数不是关键,间隔才是;确定性失败(约束/语法/解析)重放结果不变,
+        // 一次即弃,等下个触发周期(新版本下载/重启)库状态变化后再试。
+        while (attempts < MAX_DIFF_ATTEMPTS) {
+            attempts++;
+            boolean retryable = false;
+            try {
+                DiffResult result = json != null ? applyJsonDiff(json) : executeSqlFile(sql);
+                applied = result.applied();
+                failed = result.failed();
+                retryable = result.retryable();
+            } catch (Exception e) {
+                applied = 0;
+                failed = 1;
+                retryable = !isDeterministicFailure(e);
+                log.warn("apply diff {} (attempt {}/{}) failed{}", version, attempts, MAX_DIFF_ATTEMPTS,
+                        retryable ? "" : " (deterministic, skip retry)", e);
+            }
+            if (failed == 0) {
+                break;
+            }
+            log.warn("movie data attempt {}/{} for {} failed: {} statements failed, {} ok",
+                    attempts, MAX_DIFF_ATTEMPTS, version, failed, applied);
+            if (!retryable || attempts >= MAX_DIFF_ATTEMPTS) {
+                break;
+            }
+            try {
+                Thread.sleep(diffRetryBackoffMs * attempts);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("diff retry for {} interrupted, stop retrying", version);
+                break;
+            }
+        }
+        boolean success = failed == 0;
+        recordDiff(version, success, applied, failed, attempts);
+        if (success) {
+            settingRepository.save(new Setting(MOVIE_VERSION, version));
+            log.info("movie data upgraded: {} ({} rows, {} attempts, {})", version, applied, attempts,
+                    json != null ? "json" : "sql");
+        } else {
+            log.warn("movie data {} still failed after {} attempts ({} ok, {} failed), version not stamped",
+                    version, attempts, applied, failed);
+        }
+    }
+
+    /** 单个 diff 文件一轮应用的结果:applied/failed 行数;failed>0 时 retryable=失败是否瞬态(退避重试有意义)。 */
+    private record DiffResult(int applied, int failed, boolean retryable) {
+    }
+
+    /**
+     * 确定性失败:同一文件原样重放结果不变 —— 约束冲突、SQL 语法错误、JSON 契约/解析错误、文件 IO。
+     * 其余(锁竞争、乐观锁竞态、连接抖动及未分类异常)视为瞬态,退避后重试才有实际命中概率。
+     * (StaleObjectStateException 不列此:其确定性形态「行缺失」已由 upsert 原生补行根治,
+     * 剩余形态是并发竞态,重试可解。)
+     */
+    private static boolean isDeterministicFailure(Throwable e) {
+        Throwable cause = e;
+        for (int depth = 0; cause != null && depth < 10; depth++) {
+            if (cause instanceof DataIntegrityViolationException || cause instanceof BadSqlGrammarException
+                    || cause instanceof IOException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    /** JSON diff(json/{version}.json)应用:按 id 删除,MOVIE 行经 JPA upsert,META 行全原生 INSERT/UPDATE
+     *  (免 @SQLRestriction/关联代理解析,方言无关);任何异常上抛由重试循环按整文件重放。 */
+    private DiffResult applyJsonDiff(Path file) throws IOException {
+        MovieDiffPayload payload =
+                objectMapper.readValue(file.toFile(), cn.har01d.alist_tvbox.dto.MovieDiffPayload.class);
+        int rows = 0;
+        if (payload.movieDeletes() != null && !payload.movieDeletes().isEmpty()) {
+            movieRepository.deleteAllById(payload.movieDeletes());
+            rows += payload.movieDeletes().size();
+        }
+        if (payload.metaDeletes() != null && !payload.metaDeletes().isEmpty()) {
+            metaRepository.deleteAllById(payload.metaDeletes());
+            rows += payload.metaDeletes().size();
+        }
+        if (payload.movieUpserts() != null && !payload.movieUpserts().isEmpty()) {
+            upsertMovies(payload.movieUpserts());
+            rows += payload.movieUpserts().size();
+        }
+        if (payload.metaUpserts() != null && !payload.metaUpserts().isEmpty()) {
+            upsertMetas(payload.metaUpserts());
+            rows += payload.metaUpserts().size();
+        }
+        return new DiffResult(rows, 0, false);
+    }
+
+    /**
+     * MOVIE upsert:带 id 的实体经 saveAll 走 merge,行不存在时 merge 直接抛
+     * StaleObjectStateException(线上 1341.1923/1342.2033 卡死根因,首个 json 格式 diff 即含新片)。
+     * 缺失行先原生 INSERT,再 saveAll 走 merge 统一更新,整文件重放幂等。
+     */
+    private void upsertMovies(List<Movie> movies) {
+        insertMissingMovies(movies);
+        movieRepository.saveAll(movies);
+    }
+
+    /**
+     * META upsert 全原生落库,不走 JPA。merge 路线两处死穴:① {@code @SQLRestriction("disabled = false")}
+     * 让 merge 的 SELECT 看不见被禁用的行;② merge 解析 movie/tmdb 关联代理时目标行缺失直接
+     * ObjectNotFoundException(线上 1341.1923:基线重灌抹掉了 sql 链曾送入的 movie 行,json diff 又不保证
+     * 引用闭包)。原生 INSERT/UPDATE 不解析关联,列值原样落库 —— 悬空 movie_id 与 sql 路径同权,
+     * 待引用行随链路补回后自愈;禁用行也被 UPDATE 直接覆盖,不再有可见性问题。
+     */
+    private void upsertMetas(List<MovieDiffPayload.MetaPayload> rows) {
+        String ids = joinIds(rows.stream().map(MovieDiffPayload.MetaPayload::id).toList());
+        Set<Integer> existing = new HashSet<>(jdbcTemplate.queryForList(
+                "SELECT id FROM meta WHERE id IN (" + ids + ")", Integer.class));
+        String insert = "INSERT INTO meta (id, path, name, " + yearColumn() + ", score, movie_id, type, tid, "
+                + "tm_id, site_id, tmdb_id, disabled, time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        String update = "UPDATE meta SET path = ?, name = ?, " + yearColumn() + " = ?, score = ?, movie_id = ?, "
+                + "type = ?, tid = ?, tm_id = ?, site_id = ?, tmdb_id = ?, disabled = ?, time = ? WHERE id = ?";
+        for (var row : rows) {
+            Object disabled = Boolean.TRUE.equals(row.disabled());
+            Object time = java.sql.Timestamp.from(
+                    row.time() == null ? Instant.now() : Instant.ofEpochMilli(row.time()));
+            if (existing.contains(row.id())) {
+                jdbcTemplate.update(update, row.path(), row.name(), row.year(), row.score(), row.movieId(),
+                        row.type(), row.tid(), row.tmId(), row.siteId(), row.tmdbId(), disabled, time, row.id());
+            } else {
+                jdbcTemplate.update(insert, row.id(), row.path(), row.name(), row.year(), row.score(), row.movieId(),
+                        row.type(), row.tid(), row.tmId(), row.siteId(), row.tmdbId(), disabled, time);
+            }
+        }
+    }
+
+    private void insertMissingMovies(List<Movie> movies) {
+        List<Integer> ids = movies.stream().map(Movie::getId).filter(Objects::nonNull).toList();
+        if (ids.isEmpty()) {
+            return;
+        }
+        String in = joinIds(ids);
+        Set<Integer> existing = new HashSet<>(jdbcTemplate.queryForList(
+                "SELECT id FROM movie WHERE id IN (" + in + ")", Integer.class));
+        String sql = "INSERT INTO movie (id, name, genre, description, language, country, directors, editors, "
+                + "actors, cover, db_score, " + yearColumn() + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
+        for (Movie movie : movies) {
+            if (movie.getId() == null || existing.contains(movie.getId())) {
+                continue;
+            }
+            jdbcTemplate.update(sql, movie.getId(), movie.getName(), movie.getGenre(), movie.getDescription(),
+                    movie.getLanguage(), movie.getCountry(), movie.getDirectors(), movie.getEditors(),
+                    movie.getActors(), movie.getCover(), movie.getDbScore(), movie.getYear());
+        }
+    }
+
+    /** id 均为数值,拼接无注入面;空列表返回 "NULL" 使 IN 条件恒假。 */
+    private String joinIds(List<Integer> ids) {
+        return ids.isEmpty() ? "NULL" : ids.stream().map(String::valueOf).collect(Collectors.joining(","));
+    }
+
+    /** "year" 在 H2 导出的表里是小写带引号列,MySQL 需反引号,与 H2SqlConverter 的列清单同规。 */
+    private String yearColumn() {
+        return H2SqlConverter.detect(environment) == H2SqlConverter.Dialect.MYSQL ? "`year`" : "\"year\"";
+    }
+
+    /** 执行单个 SQL diff 文件(旧格式回落);逐条失败降级记录,不中断其它语句。 */
+    private DiffResult executeSqlFile(Path file) {
+        int applied = 0;
+        int failed = 0;
+        boolean retryable = false;
         try {
-            //jdbcTemplate.execute("RUNSCRIPT FROM '" + file.toString() + "'");
+            H2SqlConverter.Dialect dialect = H2SqlConverter.detect(environment);
             List<String> lines = Files.readAllLines(file);
-            for (String line : lines) {
+            if (dialect == H2SqlConverter.Dialect.H2) {
+                for (String line : lines) {
+                    try {
+                        jdbcTemplate.execute(line);
+                        applied++;
+                    } catch (Exception e) {
+                        failed++;
+                        retryable |= !isDeterministicFailure(e);
+                        log.warn("execute sql failed: {}", line.length() > 120 ? line.substring(0, 120) + "..." : line, e);
+                    }
+                }
+            } else {
+                // diff files are H2 dialect (U& escapes, "PUBLIC" identifiers) — convert
+                // each statement to the target dialect and apply in batches, falling back
+                // to per-statement execution so one bad line never aborts the whole file.
+                List<String> batch = new ArrayList<>(BATCH_SIZE);
+                for (String line : lines) {
+                    String sql = H2SqlConverter.convert(line, dialect);
+                    if (sql == null) {
+                        continue;
+                    }
+                    batch.add(sql);
+                    if (batch.size() >= BATCH_SIZE) {
+                        int size = batch.size();
+                        int[] result = executeBatch(batch);
+                        applied += size - result[0];
+                        failed += result[0];
+                        retryable |= result[1] > 0;
+                    }
+                }
+                int size = batch.size();
+                int[] result = executeBatch(batch);
+                applied += size - result[0];
+                failed += result[0];
+                retryable |= result[1] > 0;
+            }
+        } catch (Exception e) {
+            // 文件读失败不能记 0 失败 —— 否则被当 SUCCESS 盖版本号,该文件永久跳过
+            failed++;
+            retryable = !isDeterministicFailure(e);
+            log.warn("execute sql file failed: {}", file, e);
+        }
+        return new DiffResult(applied, failed, retryable);
+    }
+
+    /** 批量执行,失败降级逐条;返回 [失败条数, 其中瞬态失败条数](瞬态>0 才值得整文件重放)。 */
+    private int[] executeBatch(List<String> batch) {
+        if (batch.isEmpty()) {
+            return new int[]{0, 0};
+        }
+        try {
+            jdbcTemplate.batchUpdate(batch.toArray(new String[0]));
+            batch.clear();
+            return new int[]{0, 0};
+        } catch (Exception e) {
+            log.debug("batch update failed, falling back to per-statement execution", e);
+            int failed = 0;
+            int transientCount = 0;
+            for (String sql : batch) {
                 try {
-                    jdbcTemplate.execute(line);
-                } catch (Exception e) {
-                    log.debug("execute sql failed: {}", e);
+                    jdbcTemplate.execute(sql);
+                } catch (Exception ex) {
+                    failed++;
+                    transientCount += isDeterministicFailure(ex) ? 0 : 1;
+                    log.warn("execute sql failed: {}", sql.length() > 120 ? sql.substring(0, 120) + "..." : sql, ex);
                 }
             }
-            String version = getVersion(file);
-            settingRepository.save(new Setting(MOVIE_VERSION, version));
-            log.info("movie data upgraded: {}", version);
-        } catch (Exception e) {
-            log.warn("upgrade SQL file failed: {}", file, e);
+            batch.clear();
+            return new int[]{failed, transientCount};
         }
     }
 
     public String getAppRemoteVersion() {
-        if (environment.matchesProfiles("standalone")) {
-            try {
-                return restTemplate.getForObject("https://d.har01d.cn/app.version.txt", String.class);
-            } catch (Exception e) {
-                log.warn("", e);
-            }
-        } else {
-            try {
-                return restTemplate.getForObject("https://d.har01d.cn/app_version", String.class);
-            } catch (Exception e) {
-                log.warn("", e);
-            }
+        try {
+            return restTemplate.getForObject("https://d.har01d.cn/app.version.txt", String.class);
+        } catch (Exception e) {
+            log.warn("", e);
         }
         return "";
     }
@@ -391,14 +746,31 @@ public class DoubanService {
     }
 
     public Movie getByName(String name) {
+        return getByName(name, null);
+    }
+
+    public Movie getByName(String name, Integer year) {
         try {
+            // [dbid-x] 目录标记(追剧转存目录自带豆瓣 id):直读精确命中;未命中也剥离标记,防污染名称匹配
+            String dbid = TextUtils.parseMetaIdTag(name, "dbid");
+            if (dbid != null) {
+                Movie tagged = movieRepository.findById(Integer.valueOf(dbid)).orElse(null);
+                if (tagged != null) {
+                    log.debug("match by dbid tag: {}", dbid);
+                    return tagged;
+                }
+            }
+            name = TextUtils.stripMetaIdTags(name);
+
             Alias alias = aliasRepository.findById(name).orElse(null);
             if (alias != null) {
                 log.debug("name: {} alias: {}", name, alias.getAlias());
                 return alias.getMovie();
             }
 
-            name = TextUtils.fixName(name);
+            year = year == null ? getYearFromText(name) : year;
+            name = TextUtils.cleanMediaTitle(name);
+            name = TextUtils.collapseCjkSpaces(TextUtils.fixName(name));
             if (name.isEmpty()) {
                 return null;
             }
@@ -409,9 +781,12 @@ public class DoubanService {
                 return alias.getMovie();
             }
 
-            List<Movie> movies = movieRepository.getByName(name);
-            if (movies != null && !movies.isEmpty()) {
-                return movies.get(0);
+            List<Movie> candidates = movieRepository.getByName(name);
+            log.debug("search local Douban movie: name='{}', year={}, matches={}",
+                    name, year, candidates == null ? 0 : candidates.size());
+            Movie movie = pickBest(candidates, year);
+            if (movie != null) {
+                return movie;
             }
 
             String newName = TextUtils.updateName(name);
@@ -425,15 +800,82 @@ public class DoubanService {
                     return alias.getMovie();
                 }
 
-                movies = movieRepository.getByName(name);
-                if (movies != null && !movies.isEmpty()) {
-                    return movies.get(0);
+                candidates = movieRepository.getByName(name);
+                log.debug("search local Douban movie: name='{}', year={}, matches={}",
+                        name, year, candidates == null ? 0 : candidates.size());
+                movie = pickBest(candidates, year);
+                if (movie != null) {
+                    return movie;
                 }
+            }
+
+            // no exact-name match: fall back to name-contains scoped by the extracted
+            // year, then pick the best-matching name (exact > shortest > first).
+            // Skip for a bare season token (第一季/Season 1/S01): it is not a title and
+            // the LIKE would match every season-N show of that year (wrong title).
+            if (year != null && !isSeasonOnly(name)) {
+                List<Movie> matches = movieRepository.findByYearAndNameContains(year, name, Pageable.ofSize(10)).getContent();
+                log.debug("search local Douban movie by year/name: name='{}', year={}, matches={}",
+                        name, year, matches.size());
+                return pickBestName(matches, name);
             }
         } catch (Exception e) {
             log.warn("", e);
         }
         return null;
+    }
+
+    // among same-name candidates, pick the one whose year is closest to the target
+    // (null-year candidates are skipped; ties prefer the smaller year). With no
+    // target year or a single candidate, keep the previous first-match behavior.
+    static Movie pickBest(List<Movie> movies, Integer year) {
+        if (movies == null || movies.isEmpty()) {
+            return null;
+        }
+        if (year == null || movies.size() == 1) {
+            return movies.get(0);
+        }
+        Movie best = null;
+        int bestDelta = Integer.MAX_VALUE;
+        for (Movie m : movies) {
+            Integer y = m.getYear();
+            if (y == null) {
+                continue;
+            }
+            int delta = Math.abs(y - year);
+            if (best == null || delta < bestDelta || (delta == bestDelta && y < best.getYear())) {
+                bestDelta = delta;
+                best = m;
+            }
+        }
+        return best != null ? best : movies.get(0);
+    }
+
+    // true when the (already fixName'd) search key is only a season marker, i.e. not a
+    // discriminative title. Used to skip the year-scoped name-contains fallback.
+    static boolean isSeasonOnly(String name) {
+        return name != null && SEASON_ONLY.matcher(name).matches();
+    }
+
+    // among name-contains candidates, prefer an exact name, else the shortest name
+    static Movie pickBestName(List<Movie> movies, String name) {
+        if (movies == null || movies.isEmpty()) {
+            return null;
+        }
+        Movie best = null;
+        int bestLen = Integer.MAX_VALUE;
+        for (Movie m : movies) {
+            String n = m.getName();
+            if (name.equals(n)) {
+                return m;
+            }
+            int len = n == null ? Integer.MAX_VALUE : n.length();
+            if (best == null || len < bestLen) {
+                bestLen = len;
+                best = m;
+            }
+        }
+        return best;
     }
 
     public boolean updateMetaMovie(Integer id, MetaDto dto) {
@@ -786,6 +1228,39 @@ public class DoubanService {
                     log.debug("find year {} from path {}", year, path);
                     return year;
                 }
+            }
+        }
+        return null;
+    }
+
+    // Extract a release year to disambiguate same-name titles. An explicit title
+    // belongs to the current search result and therefore takes precedence over the
+    // mounted path, which may be an opaque share token or contain unrelated digits.
+    public Integer getYear(String name, String path) {
+        Integer year = getYearFromText(name);
+        if (year != null) {
+            return year;
+        }
+        return getYearFromPath(path);
+    }
+
+    static Integer getYearFromText(String text) {
+        if (StringUtils.isBlank(text)) {
+            return null;
+        }
+        int max = LocalDate.now().getYear() + 3;
+        Matcher m = YEAR_PATTERN.matcher(text);
+        while (m.find()) {
+            int year = Integer.parseInt(m.group(1));
+            if (year > 1960 && year < max) {
+                return year;
+            }
+        }
+        m = YEAR2_PATTERN.matcher(text);
+        while (m.find()) {
+            int year = Integer.parseInt(m.group(1));
+            if (year > 1960 && year < max) {
+                return year;
             }
         }
         return null;

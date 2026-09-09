@@ -73,6 +73,7 @@ import cn.har01d.alist_tvbox.util.BiliBiliUtils;
 import cn.har01d.alist_tvbox.util.BiliCookieRefreshUtils;
 import cn.har01d.alist_tvbox.util.Constants;
 import cn.har01d.alist_tvbox.util.DashUtils;
+import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.util.Utils;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -86,7 +87,7 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -1925,9 +1926,7 @@ public class BiliBiliService {
 
         result.put("subs", getSubtitles(aid, cid));
 
-        if ("com.fongmi.android.tv".equals(client) || "gui".equals(client)) {
-            result.put("danmaku", "https://comment.bilibili.com/" + cid + ".xml");
-        }
+        result.put("danmaku", "https://comment.bilibili.com/" + cid + ".xml");
 
         if (appProperties.isHeartbeat()) {
             heartbeat(aid, cid);
@@ -1972,24 +1971,33 @@ public class BiliBiliService {
                 sub.setLang(subtitle.getLan());
                 sub.setFormat("application/x-subrip");
                 sub.setUrl(fixSubtitleUrl(subtitle.getSubtitle_url()));
+                if (subtitle.getLan().startsWith("ai-")) {
+                    sub.setFlag(4);
+                }
                 list.add(sub);
             }
         } catch (Exception e) {
             log.warn("", e);
         }
-        if (!list.isEmpty() && allAi) {
-            Sub sub = new Sub();
-            sub.setName("关闭");
-            sub.setLang("");
-            sub.setFormat("application/x-subrip");
-            sub.setUrl("");
-            list.add(0, sub);
-        }
+//        if (!list.isEmpty() && allAi) {
+//            Sub sub = new Sub();
+//            sub.setName("关闭");
+//            sub.setLang("");
+//            sub.setFormat("application/x-subrip");
+//            sub.setUrl(fixSubtitleUrl(""));
+//            list.add(0, sub);
+//        }
         log.debug("subtitles: {}", list);
         return list;
     }
 
     public String getSubtitle(String url) {
+        if (StringUtils.isBlank(url)) {
+            return "";
+        }
+        if (!Utils.isSafeExternalUrl(url)) {
+            throw new BadRequestException("Invalid subtitle URL");
+        }
         StringBuilder text = new StringBuilder();
         try {
             HttpEntity<Void> entity = buildHttpEntity(null);

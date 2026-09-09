@@ -8,6 +8,7 @@ import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.model.Response;
 import cn.har01d.alist_tvbox.service.ShareService;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -28,13 +29,12 @@ import java.util.List;
 @RestController
 public class ShareController {
     private final ShareService shareService;
-
     public ShareController(ShareService shareService) {
         this.shareService = shareService;
     }
 
     @GetMapping("/api/shares")
-    public Page<Share> list(Pageable pageable, Integer type, String keyword) {
+    public Page<Share> list(Pageable pageable, String type, String keyword) {
         return shareService.list(pageable, type, keyword);
     }
 
@@ -59,7 +59,7 @@ public class ShareController {
     }
 
     @DeleteMapping("/api/shares")
-    public int deleteShares(Integer type) {
+    public int deleteShares(String type) {
         return shareService.deleteShares(type);
     }
 
@@ -93,6 +93,11 @@ public class ShareController {
         return shareService.getBaiduCookie(id);
     }
 
+    @GetMapping("/cookies/{id}")
+    public ObjectNode getCookies(@PathVariable String id) {
+        return shareService.getCookies(id);
+    }
+
     @GetMapping("/api/storages")
     public JsonNode listStorages(Pageable pageable) {
         return shareService.listStorages(pageable);
@@ -119,7 +124,7 @@ public class ShareController {
     }
 
     @PostMapping("/api/import-share-file")
-    public int importShares(@RequestParam("file") MultipartFile file, int type, int delay) throws IOException {
+    public int importShares(@RequestParam("file") MultipartFile file, String type, int delay) throws IOException {
         if (file.isEmpty()) {
             throw new BadRequestException();
         }
@@ -133,7 +138,7 @@ public class ShareController {
     }
 
     @GetMapping("/api/export-shares")
-    public String exportShare(HttpServletResponse response, int type) {
+    public String exportShare(HttpServletResponse response, String type) {
         return shareService.exportShare(response, type);
     }
 

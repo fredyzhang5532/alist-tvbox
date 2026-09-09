@@ -25,6 +25,9 @@ public final class Constants {
     public static final String FOLDER = "folder";
     public static final String COLLECTION = "collection";
     public static final String LIST = "list";
+    public static final String INDEX_115_NAME = "/115分享索引";
+    /** 追剧订阅固定挂载根路径:此路径下的 share 由订阅服务管理生命周期,失效不删除(自动换源),ShareService 清理豁免 */
+    public static final String SUBSCRIPTION_MOUNT_ROOT = "/追剧/";
 
     public static final String TG_DRIVERS = "9,10,5,7,8,3,2,0,6,1,12,magnet,ed2k";
 
@@ -42,6 +45,8 @@ public final class Constants {
     public static final String ALIST_PASSWORD = "alist_password";
     public static final String ALIST_USERNAME = "alist_username";
     public static final String ALIST_LOGIN = "alist_login";
+    public static final String BASIC_AUTH_USERNAME = "basic_auth_username";
+    public static final String BASIC_AUTH_PASSWORD = "basic_auth_password";
     public static final String SCHEDULE_TIME = "schedule_time";
     public static final String ZONE_ID = "Asia/Shanghai";
     public static final String ALIST_START_TIME = "alist_start_time";
@@ -49,7 +54,11 @@ public final class Constants {
     public static final String MOVIE_VERSION = "movie_version";
     public static final String OPEN_TOKEN_URL = "open_token_url";
     public static final String TOKEN = "token";
+    /** 用户级 vod token 前缀(u-{username}):该前缀保留给用户 token,全局 tokens 禁用,两个空间永不撞车。 */
+    public static final String USER_TOKEN_PREFIX = "u-";
     public static final String ENABLED_TOKEN = "enabled_token";
+    /** 亲友共享模式:开启后无 token 的旧订阅地址在安全订阅开启时仍可访问,且配置 ext 注入首个安全 token。 */
+    public static final String ANONYMOUS_ACCESS = "anonymous_access";
     public static final String INDEX_VERSION = "index_version";
     public static final String DOCKER_VERSION = "docker_version";
     public static final String APP_VERSION = "app_version";
@@ -61,4 +70,5 @@ public final class Constants {
     public static final String ALI_SECRET = "ali_secret";
     public static final String TACIT_0924_ID = "tacit0924_id";
     public static final String TACIT_FOLDER_ID = "tacit0924_folder_id";
+    public static final String GLOBAL_SUBSCRIPTION_OVERRIDE = "global_subscription_override";
 }

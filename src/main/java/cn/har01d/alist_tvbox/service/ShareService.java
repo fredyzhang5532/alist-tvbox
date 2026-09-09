@@ -1,13 +1,16 @@
 package cn.har01d.alist_tvbox.service;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.domain.DriveId;
 import cn.har01d.alist_tvbox.domain.DriverType;
-import cn.har01d.alist_tvbox.dto.ParseRequest;
 import cn.har01d.alist_tvbox.dto.OpenApiDto;
+import cn.har01d.alist_tvbox.dto.ParseRequest;
 import cn.har01d.alist_tvbox.dto.ShareLink;
 import cn.har01d.alist_tvbox.dto.SharesDto;
 import cn.har01d.alist_tvbox.entity.AListAlias;
 import cn.har01d.alist_tvbox.entity.AListAliasRepository;
+import cn.har01d.alist_tvbox.entity.Account;
+import cn.har01d.alist_tvbox.entity.AccountRepository;
 import cn.har01d.alist_tvbox.entity.DriverAccount;
 import cn.har01d.alist_tvbox.entity.DriverAccountRepository;
 import cn.har01d.alist_tvbox.entity.MetaRepository;
@@ -29,6 +32,7 @@ import cn.har01d.alist_tvbox.storage.BaiduShare;
 import cn.har01d.alist_tvbox.storage.GuangYaPanShare;
 import cn.har01d.alist_tvbox.storage.Local;
 import cn.har01d.alist_tvbox.storage.OpenList;
+import cn.har01d.alist_tvbox.storage.Pan115Index;
 import cn.har01d.alist_tvbox.storage.Pan115Share;
 import cn.har01d.alist_tvbox.storage.Pan123Share;
 import cn.har01d.alist_tvbox.storage.Pan139Share;
@@ -40,15 +44,20 @@ import cn.har01d.alist_tvbox.storage.StrmStorage;
 import cn.har01d.alist_tvbox.storage.ThunderShare;
 import cn.har01d.alist_tvbox.storage.UCShare;
 import cn.har01d.alist_tvbox.storage.UrlTree;
+import cn.har01d.alist_tvbox.util.Constants;
 import cn.har01d.alist_tvbox.util.Utils;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import jakarta.annotation.PostConstruct;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.env.Environment;
 import org.springframework.core.env.Profiles;
 import org.springframework.core.io.ClassPathResource;
@@ -64,22 +73,29 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.io.IOException;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import static cn.har01d.alist_tvbox.util.Constants.ALIST_LOGIN;
 import static cn.har01d.alist_tvbox.util.Constants.ALI_SECRET;
 import static cn.har01d.alist_tvbox.util.Constants.ATV_PASSWORD;
+import static cn.har01d.alist_tvbox.util.Constants.BILIBILI_COOKIE;
 import static cn.har01d.alist_tvbox.util.Constants.OPEN_TOKEN_URL;
 
 @Slf4j
@@ -93,6 +109,7 @@ public class ShareService {
     private final AListAliasRepository aliasRepository;
     private final SettingRepository settingRepository;
     private final SiteRepository siteRepository;
+    private final AccountRepository accountRepository;
     private final DriverAccountRepository driverAccountRepository;
     private final AccountService accountService;
     private final AListLocalService aListLocalService;
@@ -105,8 +122,9 @@ public class ShareService {
     private final Environment environment;
 
     private final int offset = 99900;
-    private int shareId = 20000;
+    private final AtomicInteger shareId = new AtomicInteger(20000);
     private final ObjectMapper objectMapper;
+    private final UserService userService;
 
     public ShareService(AppProperties appProperties,
                         ShareRepository shareRepository,
@@ -114,6 +132,7 @@ public class ShareService {
                         AListAliasRepository aliasRepository,
                         SettingRepository settingRepository,
                         SiteRepository siteRepository,
+                        AccountRepository accountRepository,
                         DriverAccountRepository driverAccountRepository,
                         AListService aListService,
                         DriverAccountService driverAccountService,
@@ -124,13 +143,15 @@ public class ShareService {
                         OfflineDownloadService offlineDownloadService,
                         RestTemplateBuilder builder,
                         Environment environment,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        UserService userService) {
         this.appProperties = appProperties;
         this.shareRepository = shareRepository;
         this.metaRepository = metaRepository;
         this.aliasRepository = aliasRepository;
         this.settingRepository = settingRepository;
         this.siteRepository = siteRepository;
+        this.accountRepository = accountRepository;
         this.driverAccountRepository = driverAccountRepository;
         this.aListService = aListService;
         this.driverAccountService = driverAccountService;
@@ -141,6 +162,7 @@ public class ShareService {
         this.offlineDownloadService = offlineDownloadService;
         this.environment = environment;
         this.objectMapper = objectMapper;
+        this.userService = userService;
         this.restTemplate = builder.rootUri("http://localhost:" + aListLocalService.getInternalPort()).build();
     }
 
@@ -174,6 +196,7 @@ public class ShareService {
         loadAListAlias();
         loadSites();
         pikPakService.loadPikPak();
+        loadIndex115();
         configFileService.writeFiles();
         readTvTxt();
 
@@ -212,7 +235,7 @@ public class ShareService {
         if (!settingRepository.existsByName("migrate_share_ids")) {
             List<Share> list = shareRepository.findAll();
             for (Share share : list) {
-                share.setId(shareId++);
+                share.setId(shareId.getAndIncrement());
             }
             shareRepository.deleteAll();
             shareRepository.saveAll(list);
@@ -224,6 +247,10 @@ public class ShareService {
     public void cleanShares() {
         cleanTempShares(true);
         cleanInvalidShares();
+    }
+
+    public int getNextId() {
+        return shareId.getAndIncrement();
     }
 
     private void cleanTempShares(boolean delete) {
@@ -297,12 +324,33 @@ public class ShareService {
                 continue;
             }
             try {
-                Storage storage = site.getVersion() == 4 ? new OpenList(site) : new AList(site);
+                Storage storage = site.getStorageVersion() != null && site.getStorageVersion() == 4 ? new OpenList(site) : new AList(site);
                 aListLocalService.saveStorage(storage);
             } catch (Exception e) {
                 log.warn("{}", e.getMessage());
             }
         }
+    }
+
+    private void loadIndex115() {
+        try {
+            Share share = new Share();
+            share.setId(7999);
+            share.setPath(Constants.INDEX_115_NAME);
+            Pan115Index storage = new Pan115Index(share);
+            aListLocalService.saveStorage(storage);
+        } catch (Exception e) {
+            log.warn("register index115 storage failed: {}", e.getMessage());
+        }
+    }
+
+    public void reloadIndex115() {
+        aListLocalService.validateAListStatus();
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.AUTHORIZATION, accountService.login());
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(null, headers);
+        ResponseEntity<Response> response = restTemplate.exchange("/api/admin/index115/reload", HttpMethod.POST, entity, Response.class);
+        log.info("reload index115 response: {}", response.getBody());
     }
 
     private void loadOpenTokenUrl() {
@@ -349,7 +397,7 @@ public class ShareService {
                     if (parts.length > 1) {
                         try {
                             Share share = new Share();
-                            share.setId(shareId++);
+                            share.setId(shareId.getAndIncrement());
                             share.setPath(parts[0]);
                             share.setShareId(parts[1]);
                             if (parts.length > 2) {
@@ -383,7 +431,7 @@ public class ShareService {
                     if (parts.length > 1) {
                         try {
                             Share share = new Share();
-                            share.setId(shareId++);
+                            share.setId(shareId.getAndIncrement());
                             share.setPath(parts[0]);
                             share.setShareId(parts[1]);
                             if (parts.length > 2) {
@@ -408,6 +456,10 @@ public class ShareService {
 
     public int importShares(SharesDto dto) {
         int count = 0;
+        Integer defaultType = DriveId.toTypeOrNull(dto.getType());
+        if (defaultType == null) {
+            defaultType = 0;
+        }
         log.info("import share list");
         for (String line : dto.getContent().split("\n")) {
             String[] parts = line.trim().split("\\s+");
@@ -415,13 +467,19 @@ public class ShareService {
             if (parts.length > 1) {
                 try {
                     Share share = new Share();
-                    share.setId(shareId);
-                    share.setType(dto.getType());
+                    share.setId(shareId.get());
+                    share.setType(defaultType);
                     share.setPath(parts[0]);
                     String[] id = parts[1].split(":", 2);
                     if (!parts[1].contains("http") && id.length > 1) {
-                        share.setType(Integer.parseInt(id[0]));
-                        share.setShareId(id[1]);
+                        Integer parsedType = DriveId.toTypeOrNull(id[0]);
+                        if (parsedType != null) {
+                            share.setType(parsedType);
+                            share.setShareId(id[1]);
+                        } else {
+                            log.warn("Unknown drive type '{}' in line: {}", id[0], line);
+                            continue;
+                        }
                     } else {
                         share.setShareId(parts[1]);
                     }
@@ -469,35 +527,11 @@ public class ShareService {
         return count;
     }
 
-    public String exportShare(HttpServletResponse response, int type) {
+    public String exportShare(HttpServletResponse response, String drive) {
+        int type = DriveId.toType(drive);
         List<Share> list = type < 0 ? shareRepository.findAll() : shareRepository.findByType(type);
         StringBuilder sb = new StringBuilder();
-        String fileName = "shares.txt";
-        if (type == 1) {
-            fileName = "pikpak_shares.txt";
-        } else if (type == 5) {
-            fileName = "quark_shares.txt";
-        } else if (type == 7) {
-            fileName = "uc_shares.txt";
-        } else if (type == 8) {
-            fileName = "115_shares.txt";
-        } else if (type == 9) {
-            fileName = "189_shares.txt";
-        } else if (type == 6) {
-            fileName = "139_shares.txt";
-        } else if (type == 2) {
-            fileName = "thunder_shares.txt";
-        } else if (type == 3) {
-            fileName = "123_shares.txt";
-        } else if (type == 0) {
-            fileName = "ali_shares.txt";
-        } else if (type == 10) {
-            fileName = "baidu_shares.txt";
-        } else if (type == 11) {
-            fileName = "strm_shares.txt";
-        } else if (type == 12) {
-            fileName = "duck_shares.txt";
-        }
+        String fileName = type < 0 ? "shares.txt" : DriveId.toDrive(type) + "_shares.txt";
 
         for (Share share : list) {
             if (share.isTemp()) {
@@ -508,13 +542,13 @@ public class ShareService {
 
             // Special handling for STRM type (type 11)
             if (share.getType() == 11) {
-                sb.append(share.getType()).append(":STRM").append("  ");
+                sb.append(DriveId.toDrive(share.getType())).append(":STRM").append("  ");
                 // Export the cookie field (Base64 encoded to avoid parsing issues)
                 String cookieJson = StringUtils.isBlank(share.getCookie()) ? "{}" : share.getCookie();
                 sb.append(java.util.Base64.getEncoder().encodeToString(cookieJson.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
             } else {
                 // Standard format for other types
-                sb.append(share.getType()).append(":")
+                sb.append(DriveId.toDrive(share.getType())).append(":")
                         .append(share.getShareId()).append("  ")
                         .append(StringUtils.isBlank(share.getFolderId()) ? "root" : share.getFolderId()).append("  ")
                         .append(share.getPassword());
@@ -544,7 +578,7 @@ public class ShareService {
                         pikpak = true;
                     }
                     if (share.getId() < offset) {
-                        shareId = Math.max(shareId, share.getId() + 1);
+                        shareId.set(Math.max(shareId.get(), share.getId() + 1));
                     }
                     if (share.getType() == null) {
                         share.setType(0);
@@ -564,34 +598,22 @@ public class ShareService {
     }
 
     private Storage saveStorage(Share share, boolean disabled) {
-        Storage storage = null;
-        if (share.getType() == null || share.getType() == 0) {
-            storage = new AliyunShare(share);
-        } else if (share.getType() == 1) {
-            storage = new PikPakShare(share);
-        } else if (share.getType() == 8) {
-            storage = new Pan115Share(share);
-        } else if (share.getType() == 4) {
-            storage = new Local(share);
-        } else if (share.getType() == 5) {
-            storage = new QuarkShare(share);
-        } else if (share.getType() == 7) {
-            storage = new UCShare(share);
-        } else if (share.getType() == 9) {
-            storage = new Pan189Share(share);
-        } else if (share.getType() == 2) {
-            storage = new ThunderShare(share);
-        } else if (share.getType() == 3) {
-            storage = new Pan123Share(share);
-        } else if (share.getType() == 6) {
-            storage = new Pan139Share(share);
-        } else if (share.getType() == 10) {
-            storage = new BaiduShare(share);
-        } else if (share.getType() == 12) {
-            storage = new GuangYaPanShare(share);
-        } else if (share.getType() == 11) {
-            storage = new StrmStorage(share);
-        }
+        Storage storage = switch (share.getType() == null ? "ali" : DriveId.toDrive(share.getType())) {
+            case "ali" -> new AliyunShare(share);
+            case "pikpak" -> new PikPakShare(share);
+            case "115" -> new Pan115Share(share);
+            case "local" -> new Local(share);
+            case "quark" -> new QuarkShare(share);
+            case "uc" -> new UCShare(share);
+            case "189" -> new Pan189Share(share);
+            case "thunder" -> new ThunderShare(share);
+            case "123" -> new Pan123Share(share);
+            case "139" -> new Pan139Share(share);
+            case "baidu" -> new BaiduShare(share);
+            case "duck" -> new GuangYaPanShare(share);
+            case "strm" -> new StrmStorage(share);
+            default -> null;
+        };
 
         if (storage != null) {
             storage.setDisabled(disabled);
@@ -675,7 +697,12 @@ public class ShareService {
         return sb;
     }
 
-    public Page<Share> list(Pageable pageable, Integer type, String keyword) {
+    public Page<Share> list(Pageable pageable, String drive) {
+        return list(pageable, drive, null);
+    }
+
+    public Page<Share> list(Pageable pageable, String drive, String keyword) {
+        Integer type = DriveId.toTypeOrNull(drive);
         if (type != null && type > -1) {
             if (StringUtils.isBlank(keyword)) {
                 return shareRepository.findByType(type, pageable);
@@ -723,10 +750,149 @@ public class ShareService {
         return "";
     }
 
+    public ObjectNode getCookies(String id) {
+        String aliSecret = settingRepository.findById(ALI_SECRET).map(Setting::getValue).orElse("");
+        ObjectNode result = objectMapper.createObjectNode();
+        // 用户凭证下载:仅认 u-{username}-{vod_secret}(配置注入的 secret 同源)。u-{username} 本身无熵
+        //(用户名可猜测),不能当授权用,裸 u- token / 密钥不符一律空结果;
+        // 命中后仍按归属过滤,只下发本人账号凭证;B 站 cookie 等全局凭证仅共享 secret(管理员设备)可取
+        int uid = 0;
+        if (id.startsWith(Constants.USER_TOKEN_PREFIX)) {
+            String body = id.substring(Constants.USER_TOKEN_PREFIX.length());
+            int sep = body.lastIndexOf('-');
+            if (sep > 0 && sep + 1 < body.length()) {
+                var user = userService.findByUsername(body.substring(0, sep));
+                String secret = body.substring(sep + 1);
+                if (user != null && secret.equals(userService.vodSecretOf(user))) {
+                    uid = user.getId() == null ? 0 : user.getId();
+                }
+            }
+        }
+        if (!aliSecret.equals(id) && uid == 0) {
+            return result;
+        }
+
+        Optional<DriverAccount> quark = account(DriverType.QUARK, uid);
+        Optional<DriverAccount> uc = account(DriverType.UC, uid);
+        Optional<DriverAccount> baidu = account(DriverType.BAIDU, uid);
+        putCookie(result, "quark", quark.map(DriverAccount::getCookie).orElse("").trim());
+        putCookie(result, "uc", uc.map(DriverAccount::getCookie).orElse("").trim());
+        putCookie(result, "baidu", baidu.map(DriverAccount::getCookie).orElse("").trim());
+
+        account(DriverType.CLOUD189, uid).ifPresent(account -> {
+            ObjectNode node = result.putObject("189");
+            node.put("cookie", account.getCookie());
+            node.put("username", account.getUsername());
+            node.put("password", account.getPassword());
+        });
+
+        account(DriverType.PAN123, uid).ifPresent(account -> {
+            ObjectNode node = result.putObject("123");
+            node.put("username", account.getUsername());
+            node.put("password", account.getPassword());
+        });
+
+        account(DriverType.QUARK_TV, uid).ifPresent(account -> {
+            ObjectNode node = result.putObject("quarkTv");
+            node.put("cookie", account.getCookie());
+            node.put("token", account.getToken());
+        });
+
+        account(DriverType.UC_TV, uid).ifPresent(account -> {
+            ObjectNode node = result.putObject("ucTv");
+            node.put("device_id", account.getUsername());
+            node.put("access_token", account.getPassword());
+            node.put("refresh_token", account.getToken());
+        });
+
+        account(DriverType.THUNDER, uid).ifPresent(account -> {
+            ObjectNode node = result.putObject("xunlei");
+            node.put("refresh_token", account.getCookie());
+            node.put("access_token", account.getToken());
+            try {
+                String code = objectMapper.readTree(account.getAddition()).get("device_id").asText();
+                node.put("device_id", code);
+            } catch (JsonProcessingException ex) {
+                // ignore
+            }
+        });
+
+        account(DriverType.PAN115, uid).ifPresent(account -> {
+            ObjectNode node = result.putObject("115");
+            node.put("cookie", account.getCookie());
+            try {
+                String code = objectMapper.readTree(account.getAddition()).get("delete_code").asText();
+                node.put("delete_code", code);
+            } catch (JsonProcessingException ex) {
+                // ignore
+            }
+        });
+
+        Optional<Account> ali = uid == 0 ? accountRepository.getFirstByMasterTrue()
+                : accountRepository.findFirstByOwnerUidOrderByIdAsc(uid);
+        ali.ifPresent(account -> {
+            ObjectNode node = result.putObject("ali");
+            node.put("refresh_token", account.getRefreshToken());
+            node.put("access_token", account.getAccessToken());
+        });
+
+        putToken(result, "139", account(DriverType.PAN139, uid).map(DriverAccount::getToken).orElse("").trim());
+        putToken(result, "guangya", account(DriverType.GUANGYA, uid).map(DriverAccount::getToken).orElse("").trim());
+        // B 站 cookie 是全局凭证:仅共享 secret(管理员设备)下发;用户 token 不带,spider 游客降级
+        if (uid == 0) {
+            putCookie(result, "bili", settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse(""));
+        }
+        return result;
+    }
+
+    /** getCookies 账号选取:共享 secret(uid=0)取全局 master;用户 token 取其本人账号。 */
+    private Optional<DriverAccount> account(DriverType type, int uid) {
+        return uid == 0 ? driverAccountRepository.findByTypeAndMasterTrue(type)
+                : driverAccountRepository.findFirstByOwnerUidAndTypeOrderByIdAsc(uid, type);
+    }
+
+    private String getAvailableAliRefreshToken(String id) {
+        try {
+            return accountService.getAliRefreshToken(id);
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    private String getAvailableAliOpenRefreshToken(String id) {
+        try {
+            return accountService.getAliOpenRefreshToken(id);
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    private void putCookie(ObjectNode result, String key, String cookie) {
+        if (StringUtils.isBlank(cookie)) {
+            return;
+        }
+        ObjectNode node = result.putObject(key);
+        node.put("cookie", cookie.trim());
+    }
+
+    private void putToken(ObjectNode result, String key, String token) {
+        if (StringUtils.isBlank(token)) {
+            return;
+        }
+        ObjectNode node = result.putObject(key);
+        node.put("token", token.trim());
+    }
+
+    private void putLogin(ObjectNode result, String key, String username, String password) {
+        ObjectNode node = result.putObject(key);
+        node.put("username", username.trim());
+        node.put("password", password.trim());
+    }
+
     private static final Pattern SHARE_115_LINK = Pattern.compile("https://(?:115|115cdn|anxia).com/s/([\\w-]+)(?:\\?password=([\\w-]+))?");
     private static final Pattern SHARE_XL_LINK = Pattern.compile("https://pan.xunlei.com/s/([\\w-]+)(?:\\?pwd=([\\w-]+))?");
     private static final Pattern SHARE_BD_LINK1 = Pattern.compile("https://pan.baidu.com/s/([\\w-]+)(?:\\?pwd=([\\w-]+))?");
-    private static final Pattern SHARE_BD_LINK2 = Pattern.compile("https://pan.baidu.com/share/init\\?surl=([\\w-]+)(?:&pwd=([\\w-]+))?");
+    private static final Pattern SHARE_BD_LINK2 = Pattern.compile("https://pan.baidu.com/(?:share|wap)/init\\?surl=([\\w-]+)(?:&pwd=([\\w-]+))?");
     private static final Pattern SHARE_PK_LINK = Pattern.compile("https://mypikpak.com/s/([\\w-]+)(?:\\?pwd=([\\w-]+))?");
     private static final Pattern SHARE_189_LINK1 = Pattern.compile("https://cloud.189.cn/web/share\\?code=([\\w-]+)");
     private static final Pattern SHARE_189_LINK2 = Pattern.compile("https://cloud.189.cn/t/([\\w-]+)(?:（访问码：(\\w+)）)?");
@@ -734,12 +900,15 @@ public class ShareService {
     private static final Pattern SHARE_139_LINK1 = Pattern.compile("https://caiyun.139.com/m/i\\?([\\w-]+)");
     private static final Pattern SHARE_139_LINK2 = Pattern.compile("https://yun.139.com/shareweb/#/w/i/([\\w-]+)");
     private static final Pattern SHARE_139_LINK3 = Pattern.compile("https://caiyun.139.com/w/i/([\\w-]+)");
+    private static final Pattern SHARE_139_LINK4 = Pattern.compile("https://caiyun.feixin.10086.cn/([\\w-]+)");
     private static final Pattern SHARE_QUARK_LINK = Pattern.compile("https://pan.quark.cn/s/([\\w-]+)");
     private static final Pattern SHARE_UC_LINK = Pattern.compile("https://(?:drive|fast).uc.cn/s/([\\w-]+)(?:\\?password=(\\w+))?");
     private static final Pattern SHARE_ALI_LINK1 = Pattern.compile("https://www.(?:alipan|aliyundrive).com/s/([\\w-]+)/folder/([\\w-]+)(?:\\?password=(\\w+))?");
     private static final Pattern SHARE_ALI_LINK2 = Pattern.compile("https://www.(?:alipan|aliyundrive).com/s/([\\w-]+)(?:\\?password=(\\w+))?");
-    private static final Pattern SHARE_123_LINK1 = Pattern.compile("https://(?:www\\.)?123...\\.com/s/([\\w-]+)提取码[:：](\\w+)");
-    private static final Pattern SHARE_123_LINK2 = Pattern.compile("https://(?:www\\.)?123...\\.com/s/([\\w-]+)(?:\\.html)?(?:\\??提取码[:：](\\w+))?");
+    private static final Pattern SHARE_123_LINK1 = Pattern.compile("https://(?:www\\.)?123(?:684|685|865|912|pan|592)\\.(?:com|cn)/s/([\\w-]+)提取码[:：](\\w+)");
+    private static final Pattern SHARE_123_LINK2 = Pattern.compile("https://(?:www\\.)?123(?:684|685|865|912|pan|592)\\.(?:com|cn)/s/([\\w-]+)(?:\\.html)?(?:\\??提取码[:：](\\w+))?");
+    private static final Pattern SHARE_123_LINK3 = Pattern.compile("https://.+\\.share\\.123pan\\.cn/123pan/([\\w-]+)");
+    private static final Pattern SHARE_123_LINK4 = Pattern.compile("https://(?:www\\.)?123pan\\.(?:cn|com)/123pan/([\\w-]+)");
     private static final Pattern SHARE_GUANGYA_LINK = Pattern.compile("https://(?:www\\.)?guangyapan\\.com/s/([A-Za-z0-9_-]+)");
     public static final Pattern PASSWORD = Pattern.compile("(?:密码|提取码|验证码|访问码|分享密码|密钥|pwd|password|code|share_pwd|pass_code|#)[=:：\\s]*([a-zA-Z0-9]{1,4})");
 
@@ -748,18 +917,18 @@ public class ShareService {
         tid = tid.split("/")[0];
         String[] parts = tid.split("@");
         String id = parts[1];
-        String url = switch (parts[0]) {
-            case "0" -> "https://www.alipan.com/s/" + id;
-            case "1" -> "https://mypikpak.com/s/" + id;
-            case "2" -> "https://pan.xunlei.com/s/" + id;
-            case "3" -> "https://123pan.com/s/" + id;
-            case "5" -> "https://pan.quark.cn/s/" + id;
-            case "6" -> "https://caiyun.139.com/w/i/" + id;
-            case "7" -> "https://drive.uc.cn/s/" + id;
-            case "8" -> "https://115.com/s/" + id;
-            case "9" -> "https://cloud.189.cn/t/" + id;
-            case "10" -> "https://pan.baidu.com/s/" + id;
-            case "12" -> "https://www.guangyapan.com/s/" + id;
+        String url = switch (DriveId.normalize(parts[0])) {
+            case "ali" -> "https://www.alipan.com/s/" + id;
+            case "pikpak" -> "https://mypikpak.com/s/" + id;
+            case "thunder" -> "https://pan.xunlei.com/s/" + id;
+            case "123" -> "https://123pan.com/s/" + id;
+            case "quark" -> "https://pan.quark.cn/s/" + id;
+            case "139" -> "https://caiyun.139.com/w/i/" + id;
+            case "uc" -> "https://drive.uc.cn/s/" + id;
+            case "115" -> "https://115.com/s/" + id;
+            case "189" -> "https://cloud.189.cn/t/" + id;
+            case "baidu" -> "https://pan.baidu.com/s/" + id;
+            case "duck" -> "https://www.guangyapan.com/s/" + id;
             default -> throw new IllegalArgumentException("Unexpected type: " + parts[0]);
         };
         if (parts.length > 2) {
@@ -768,8 +937,94 @@ public class ShareService {
         return url;
     }
 
+    private static final Pattern URL_PWD = Pattern.compile("[?&]pwd=([a-zA-Z0-9]{4})(?:[^a-zA-Z0-9]|$)");
+    private static final Pattern URL_PASSWORD = Pattern.compile("[?&]password=([a-zA-Z0-9]{4})(?:[^a-zA-Z0-9]|$)");
+    private static final Pattern TIANYI_ACCESS_CODE = Pattern.compile("(?:（访问码：|%EF%BC%88%E8%AE%BF%E9%97%AE%E7%A0%81%EF%BC%9A)([a-zA-Z0-9]+)(?:）|%EF%BC%89)");
+    private static final Pattern PAN123_EXTRACT_CODE = Pattern.compile("(?:提取码|%E6%8F%90%E5%8F%96%E7%A0%81)(?:[:：]|%EF%BC%9A|%3A)([a-zA-Z0-9]+)");
+
+    /**
+     * Validate share link to prevent open redirect and SSRF attacks
+     * Only allow whitelisted cloud storage domains
+     */
+    private boolean isValidShareLink(String link) {
+        if (StringUtils.isBlank(link)) {
+            return false;
+        }
+
+        // Allow magnet and ed2k links for offline download
+        String lowerLink = link.toLowerCase();
+        if (lowerLink.startsWith("magnet:") || lowerLink.startsWith("ed2k:")) {
+            return true;
+        }
+
+        // Must be HTTPS
+        if (!lowerLink.startsWith("https://")) {
+            log.warn("Share link must use HTTPS: {}", link);
+            return false;
+        }
+
+        // Whitelist of allowed domains
+        String[] allowedDomains = {
+                "alipan.com",
+                "aliyundrive.com",
+                "123684.com", "123685.com", "123865.com", "123912.com", "123pan.com", "123592.com",
+                "123684.cn", "123685.cn", "123865.cn", "123912.cn", "123pan.cn", "123592.cn",
+                "guangyapan.com",
+                "mypikpak.com",
+                "xunlei.com",
+                "quark.cn",
+                "139.com",
+                "uc.cn",
+                "115.com", "115cdn.com", "anxia.com",
+                "189.cn",
+                "baidu.com"
+        };
+
+        try {
+            URI uri = new URI(link);
+            String host = uri.getHost();
+            if (host == null) {
+                return false;
+            }
+
+            host = host.toLowerCase();
+            for (String domain : allowedDomains) {
+                if (host.contains(domain)) {
+                    return true;
+                }
+            }
+
+            log.warn("Share link from untrusted domain: {}", host);
+            return false;
+        } catch (Exception e) {
+            log.warn("Invalid share link URL: {}", link, e);
+            return false;
+        }
+    }
+
     private String parsePassword(String url) {
-        var m = PASSWORD.matcher(url);
+        // 天翼云盘 URL 编码的访问码
+        var m = TIANYI_ACCESS_CODE.matcher(url);
+        if (m.find()) {
+            return m.group(1);
+        }
+        // URL 中的 pwd 参数
+        m = URL_PWD.matcher(url);
+        if (m.find()) {
+            return m.group(1);
+        }
+        // 115网盘 URL 中的 password 参数
+        m = URL_PASSWORD.matcher(url);
+        if (m.find()) {
+            return m.group(1);
+        }
+        // 123网盘 URL 编码的提取码
+        m = PAN123_EXTRACT_CODE.matcher(url);
+        if (m.find()) {
+            return m.group(1);
+        }
+        // 通用密码提取
+        m = PASSWORD.matcher(url);
         if (m.find()) {
             return m.group(1);
         }
@@ -794,7 +1049,7 @@ public class ShareService {
         if (!url.startsWith("http")) {
             String[] parts = url.split("@");
             if (parts.length == 3 || (parts.length == 2 && url.endsWith("@"))) {
-                int type = Integer.parseInt(parts[0]);
+                int type = DriveId.toType(parts[0]);
                 share.setType(type);
                 share.setShareId(type == 10 ? normalizeBaiduShareId(parts[1]) : parts[1]);
                 if (parts.length > 2) {
@@ -869,6 +1124,14 @@ public class ShareService {
             return true;
         }
 
+        m = SHARE_139_LINK4.matcher(url);
+        if (m.find()) {
+            share.setType(6);
+            share.setShareId(m.group(1));
+            share.setPassword(parsePassword(url));
+            return true;
+        }
+
         m = SHARE_123_LINK1.matcher(url);
         if (m.find()) {
             share.setType(3);
@@ -878,6 +1141,22 @@ public class ShareService {
         }
 
         m = SHARE_123_LINK2.matcher(url);
+        if (m.find()) {
+            share.setType(3);
+            share.setShareId(m.group(1));
+            share.setPassword(parsePassword(url));
+            return true;
+        }
+
+        m = SHARE_123_LINK3.matcher(url);
+        if (m.find()) {
+            share.setType(3);
+            share.setShareId(m.group(1));
+            share.setPassword(parsePassword(url));
+            return true;
+        }
+
+        m = SHARE_123_LINK4.matcher(url);
         if (m.find()) {
             share.setType(3);
             share.setShareId(m.group(1));
@@ -998,6 +1277,13 @@ public class ShareService {
 
     public String add(ShareLink dto) {
         String link = StringUtils.trimToEmpty(URLDecoder.decode(dto.getLink(), StandardCharsets.UTF_8));
+
+        // Validate URL to prevent open redirect and SSRF
+        if (!isValidShareLink(link)) {
+            log.warn("Blocked invalid or suspicious share link: {}", link);
+            throw new BadRequestException("Invalid share link format");
+        }
+
         if (isOfflineDownloadLink(link)) {
             return offlineDownloadService.downloadPath(new ParseRequest(link));
         }
@@ -1011,7 +1297,7 @@ public class ShareService {
         }
         if (StringUtils.isBlank(dto.getPath())) {
             share.setTemp(true);
-            share.setPath("temp/" + share.getType() + "@" + share.getShareId() + "@" + share.getPassword());
+            share.setPath("temp/" + DriveId.toDrive(share.getType()) + "@" + share.getShareId() + "@" + share.getPassword());
         } else {
             share.setPath(dto.getPath());
         }
@@ -1041,6 +1327,80 @@ public class ShareService {
         return path;
     }
 
+    // Short-lived link -> title cache populated at search time (before the Share row
+    // exists) so the very first detail call - which creates the Share - can still recover
+    // the real title and persist it. Shared across all detail entry points (/pansou,
+    // /parse) so a title captured by a search on one path is visible on another.
+    private final Cache<String, String> shareTitleCache = Caffeine.newBuilder().maximumSize(200).expireAfterWrite(Duration.ofHours(2)).build();
+
+    public void cacheShareTitle(String link, String title) {
+        if (StringUtils.isNotBlank(link) && StringUtils.isNotBlank(title)) {
+            shareTitleCache.put(link, title);
+        }
+    }
+
+    // Parse a raw share link into a transient Share (type + normalized shareId) the same
+    // way add() does, but without mounting storage or any network call. Used to key the
+    // title store by the same (type, shareId) that the persisted Share rows use, so the
+    // lookup survives shareId normalization (e.g. baidu URL -> 23-char id).
+    public Share parseShareLink(String link) {
+        if (StringUtils.isBlank(link)) {
+            return null;
+        }
+        Share probe = new Share();
+        probe.setShareId(link);
+        return parseLink(probe) ? probe : null;
+    }
+
+    // Recover the persisted display title for a raw share link, or null if unknown.
+    public String findShareTitle(String link) {
+        Share probe = parseShareLink(link);
+        if (probe == null) {
+            return null;
+        }
+        return shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId())
+                .map(Share::getTitle)
+                .orElse(null);
+    }
+
+    // Persist the display title for a raw share link's existing Share row (best-effort).
+    // Called when a title is recovered from a transient source (detail param or the
+    // in-memory cache) so that history re-entry after cache expiry/restart can recover it.
+    public void saveShareTitle(String link, String title) {
+        if (StringUtils.isBlank(title)) {
+            return;
+        }
+        try {
+            Share probe = parseShareLink(link);
+            if (probe == null) {
+                return;
+            }
+            shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId()).ifPresent(share -> {
+                if (!Objects.equals(title, share.getTitle())) {
+                    share.setTitle(title);
+                    shareRepository.save(share);
+                }
+            });
+        } catch (Exception e) {
+            log.warn("saveShareTitle failed for {}: {}", link, e.getMessage());
+        }
+    }
+
+    // Resolve the display title for a raw share link from any detail entry point
+    // (RemoteSearchService.detail via /pansou, ParseService.drive via /parse, ...):
+    // caller param -> in-memory search cache -> persisted Share.title. A known title is
+    // persisted so a later history re-entry (cache expired / restart) recovers it.
+    // Returns null when the title is unknown (caller then falls back to the storage
+    // folder name).
+    public String resolveShareTitle(String link, String title) {
+        String known = StringUtils.defaultIfBlank(title, shareTitleCache.getIfPresent(link));
+        if (StringUtils.isNotBlank(known)) {
+            saveShareTitle(link, known);
+            return known;
+        }
+        return findShareTitle(link);
+    }
+
     private boolean isOfflineDownloadLink(String link) {
         String value = StringUtils.lowerCase(link);
         return value.startsWith("magnet:") || value.startsWith("ed2k:");
@@ -1055,12 +1415,13 @@ public class ShareService {
 
         try {
             String token = accountService.login();
-            synchronized (this) {
-                if (environment.acceptsProfiles(Profiles.of("docker"))) {
-                    shareId = aListLocalService.getNextStorageId();
-                }
-                share.setId(shareId++);
+            int id;
+            if (environment.acceptsProfiles(Profiles.of("docker"))) {
+                id = aListLocalService.getNextStorageId();
+            } else {
+                id = shareId.getAndIncrement();
             }
+            share.setId(id);
 
             share.setPath(Storage.getMountPath(share));
             saveStorage(share, true);
@@ -1141,15 +1502,36 @@ public class ShareService {
     }
 
     private void fixStrmConfig(Share share) {
-        // STRM 类型: 将 strmConfig 对象序列化到 cookie 字段
-        if (share.getType() == 11 && share.getStrmConfig() != null) {
-            try {
-                String jsonConfig = objectMapper.writeValueAsString(share.getStrmConfig());
-                share.setCookie(jsonConfig);
-            } catch (Exception e) {
-                log.warn("解析STRM配置失败", e);
-            }
+        if (share.getType() != 11) {
+            return;
         }
+
+        try {
+            JsonNode config = null;
+            if (share.getStrmConfig() != null) {
+                config = objectMapper.valueToTree(share.getStrmConfig());
+            } else if (StringUtils.isNotBlank(share.getCookie())) {
+                config = objectMapper.readTree(share.getCookie());
+            }
+
+            if (config == null) {
+                return;
+            }
+
+            if (isAListLoginEnabled() && config instanceof ObjectNode objectNode) {
+                objectNode.put("withSign", true);
+            }
+            share.setCookie(objectMapper.writeValueAsString(config));
+        } catch (Exception e) {
+            log.warn("解析STRM配置失败", e);
+        }
+    }
+
+    private boolean isAListLoginEnabled() {
+        return settingRepository.findById(ALIST_LOGIN)
+                .map(Setting::getValue)
+                .orElse("")
+                .equals("true");
     }
 
     private static void fixFolderId(Share share) {
@@ -1211,7 +1593,8 @@ public class ShareService {
         deleteStorage(id, token);
     }
 
-    public int deleteShares(Integer type) {
+    public int deleteShares(String drive) {
+        Integer type = DriveId.toTypeOrNull(drive);
         List<Share> shares = type != null ? shareRepository.findByType(type) : shareRepository.findAll();
         shareRepository.deleteAll(shares);
         log.info("delete {} shares type: {}", shares.size(), type);
@@ -1241,6 +1624,16 @@ public class ShareService {
         return response.getBody();
     }
 
+    /** 路径归属存储的驱动名(追剧手动路径资源标注盘线路);找不到返回 null,不校验 AList 状态(尽力而为)。 */
+    public String findStorageDriverByPath(String path) {
+        try {
+            return aListLocalService.findStorageDriverByPath(path);
+        } catch (Exception e) {
+            log.warn("find storage driver by path failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
     public void validateStorages() {
         aListLocalService.validateAListStatus();
         HttpHeaders headers = new HttpHeaders();
@@ -1264,6 +1657,11 @@ public class ShareService {
                     if (invalid(status)) {
                         int id = item.get("id").asInt();
                         String path = item.get("mount_path").asText();
+                        // 追剧订阅的固定挂载:失效不删,由订阅巡检换源(重挂同一 mount_path),删了会断播放历史
+                        if (path.startsWith(Constants.SUBSCRIPTION_MOUNT_ROOT)) {
+                            log.info("skip subscription share (auto re-source by media subscription check): {} {}", id, path);
+                            continue;
+                        }
                         log.warn("delete invalid share: {} {} reason: {}", id, path, status);
                         deleteShare(id);
                         count++;
@@ -1298,6 +1696,7 @@ public class ShareService {
                 || status.contains("分享不存在")
                 || status.contains("文件不存在")
                 || status.contains("文件没有被分享")
+                || status.contains("分享无法访问")
                 ;
     }
 
@@ -1364,7 +1763,7 @@ public class ShareService {
                 share.setPath(parts[0]);
                 String[] sid = parts[1].split(":", 2);
                 if (sid.length > 1) {
-                    share.setType(Integer.parseInt(sid[0]));
+                    share.setType(DriveId.toType(sid[0]));
                     share.setShareId(sid[1]);
                 } else {
                     share.setType(0);

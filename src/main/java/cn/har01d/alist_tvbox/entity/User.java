@@ -21,7 +21,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 
 @Getter
 @Setter
-@ToString
+@ToString(exclude = "password")
 @RequiredArgsConstructor
 @Entity
 @Table(name = "x_user")
@@ -32,6 +32,9 @@ public class User {
     private String username;
     @JsonIgnore
     private String password;
+    /** 用户凭证下载密钥(/cookies/u-{username}-{secret}):用户名可猜测,u- token 本身无熵,凭证下发靠此随机密钥 */
+    @JsonIgnore
+    private String vodSecret;
     @Enumerated(EnumType.STRING)
     private Role role = Role.USER;
     private final Instant createdTime = Instant.now();

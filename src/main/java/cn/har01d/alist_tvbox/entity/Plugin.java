@@ -1,12 +1,8 @@
 package cn.har01d.alist_tvbox.entity;
 
+import cn.har01d.alist_tvbox.model.PluginFilterConfigSchema;
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
-import jakarta.persistence.TableGenerator;
+import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -20,6 +16,10 @@ import java.time.OffsetDateTime;
 @RequiredArgsConstructor
 @Entity
 @TableGenerator(name = "tableGenerator", table = "id_generator", pkColumnName = "entity_name", valueColumnName = "next_id", allocationSize = 1)
+@Table(indexes = {
+    @Index(name = "idx_plugin_external_id", columnList = "external_id"),
+    @Index(name = "idx_plugin_url", columnList = "url")
+})
 public class Plugin {
     @Id
     @GeneratedValue(strategy = GenerationType.TABLE, generator = "tableGenerator")
@@ -27,15 +27,18 @@ public class Plugin {
 
     private String name;
 
+    @Column(name = "external_id")
+    private String externalId;
+
     @Column(columnDefinition = "TEXT")
     private String url;
 
     private boolean enabled = true;
 
     @Column(name = "sort_order")
-    private int sortOrder;
+    private Integer sortOrder;
 
-    @Column(name = "`extend`", columnDefinition = "TEXT")
+    @Column(name = "\"extend\"", columnDefinition = "TEXT")
     private String extend;
 
     @Column(name = "source_name")
@@ -48,7 +51,7 @@ public class Plugin {
     @Column(columnDefinition = "TEXT")
     private String content;
 
-    @Column(name = "`version`")
+    @Column(name = "\"version\"")
     private Integer version;
 
     @Column(name = "last_checked_at")
@@ -56,4 +59,8 @@ public class Plugin {
 
     @Column(name = "last_error", columnDefinition = "TEXT")
     private String lastError;
+
+    // 运行时临时字段，不入库。由 PluginService 从脚本内容解析后挂载，供前端生成可视化配置表单。
+    @Transient
+    private PluginFilterConfigSchema configSchema;
 }

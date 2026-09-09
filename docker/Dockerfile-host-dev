@@ -11,10 +11,11 @@ COPY init.sh /
 
 COPY data/tvbox.zip /
 COPY data/index.share.zip /
-COPY data/cat.zip /
 COPY data/data.zip /
+COPY data/cat.zip /
 COPY data/pg.zip /
 COPY data/zx.zip /
+COPY data/nginx.full.conf /etc/nginx/http.d/default.conf
 COPY data/base_version /
 
 COPY target/application/ ./
@@ -22,6 +23,8 @@ COPY target/application/ ./
 COPY data/version /app_version
 
 EXPOSE 4567 5678
+
+VOLUME ["/www/static"]
 
 ENTRYPOINT ["/entrypoint.sh"]
 

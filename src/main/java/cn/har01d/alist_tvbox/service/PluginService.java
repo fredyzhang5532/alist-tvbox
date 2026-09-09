@@ -7,17 +7,24 @@ import cn.har01d.alist_tvbox.entity.PluginRepository;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
 import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.exception.NotFoundException;
+import cn.har01d.alist_tvbox.model.PluginFilterConfigSchema;
+import cn.har01d.alist_tvbox.util.ConfigSchemaParser;
+import cn.har01d.alist_tvbox.util.Utils;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestTemplate;
 
+import java.io.IOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -26,11 +33,29 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
 @Service
 public class PluginService {
     private static final String PLUGIN_INDEX_FILE = "spiders_v2.json";
+    private static final Pattern PLUGIN_ID = Pattern.compile("(?m)^\\s*//@id:([^\\s]+)\\s*$");
+    private static final Pattern PYTHON_PLUGIN_ID = Pattern.compile(
+            "(?m)^\\s*PLUGIN_ID\\s*=\\s*['\"]([^'\"]+)['\"]\\s*(?:#.*)?$");
     private static final Pattern PLUGIN_VERSION = Pattern.compile("(?m)^\\s*//@version:(\\d+)\\s*$");
+    private static final Pattern PLUGIN_NAME = Pattern.compile("(?m)^\\s*//@name:(.+)\\s*$");
+    // spider 插件配置结构声明：脚本顶层 PLUGIN_CONFIG_SCHEMA = { ... }；解析逻辑见 ConfigSchemaParser。
+    private static final String PLUGIN_CONFIG_CONST = "PLUGIN_CONFIG_SCHEMA";
     private static final String GITHUB_PROXY = "github_proxy";
+
+    // 文件-backed 插件：url 形如 /static/plugins/<相对路径>.py，由静态文件目录双向同步管理
+    public static final String STATIC_URL_PREFIX = "/static/";
+    public static final String FILE_PLUGIN_DIR = "plugins";
+    public static final String FILE_PLUGIN_URL_PREFIX = STATIC_URL_PREFIX + FILE_PLUGIN_DIR + "/";
+    // 文件-backed 自定义网页源：static/webhome/pages/ 下的 .html 自动注册为订阅源(csp_WebHome 站点)。
+    // 页面经 /webhome/** 映射访问(带 no-cache,与内置 app.html 同机制),url 身份仍以 /static/ 前缀落库
+    public static final String WEB_PAGE_DIR = "webhome/pages";
+    public static final String WEB_PAGE_URL_PREFIX = STATIC_URL_PREFIX + WEB_PAGE_DIR + "/";
 
     private final PluginRepository pluginRepository;
     private final SettingRepository settingRepository;
@@ -38,6 +63,7 @@ public class PluginService {
     private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
     private final SubscriptionSourceService subscriptionSourceService;
+    private final GitHubProxyService gitHubProxyService;
 
     @Autowired
     public PluginService(PluginRepository pluginRepository,
@@ -45,13 +71,15 @@ public class PluginService {
                          RestTemplateBuilder builder,
                          ObjectMapper objectMapper,
                          TransactionTemplate transactionTemplate,
-                         SubscriptionSourceService subscriptionSourceService) {
+                         SubscriptionSourceService subscriptionSourceService,
+                         GitHubProxyService gitHubProxyService) {
         this.pluginRepository = pluginRepository;
         this.settingRepository = settingRepository;
         this.restTemplate = builder.build();
         this.objectMapper = objectMapper;
         this.transactionTemplate = transactionTemplate;
         this.subscriptionSourceService = subscriptionSourceService;
+        this.gitHubProxyService = gitHubProxyService;
     }
 
     public record ImportResult(
@@ -67,14 +95,16 @@ public class PluginService {
     ) {
     }
 
-    private record ImportEntry(String url, Integer version, boolean valid) {
+    private record ImportEntry(String url, String externalId, Integer version, boolean valid) {
     }
 
-    private record DownloadedPlugin(String body, String sourceName, Integer version) {
+    private record DownloadedPlugin(String body, String sourceName, String externalId, Integer version) {
     }
 
     public List<Plugin> findAll() {
-        return pluginRepository.findAllByOrderBySortOrderAscIdAsc();
+        return pluginRepository.findAllByOrderBySortOrderAscIdAsc().stream()
+                .peek(this::applyConfigSchema)
+                .toList();
     }
 
     public List<Plugin> findEnabled() {
@@ -84,12 +114,97 @@ public class PluginService {
     @Transactional
     public Plugin create(Plugin plugin) {
         validateUrlUniqueness(plugin.getUrl(), null);
-        applyDownloadedPlugin(plugin, downloadPluginData(plugin.getUrl()), false);
+        applyDownloadedPlugin(plugin, downloadPluginData(plugin.getUrl()), null, false);
+        validateExternalIdUniqueness(plugin.getExternalId(), null);
         plugin.setEnabled(true);
         plugin.setSortOrder(subscriptionSourceService.nextSortOrder());
         plugin.setLastCheckedAt(OffsetDateTime.now());
         plugin.setLastError("");
         return pluginRepository.save(plugin);
+    }
+
+    /**
+     * 静态文件目录双向同步入口：按 url 严格匹配 upsert，不发起 HTTP 下载。
+     * externalId 与现有不同 url 的插件冲突时丢弃，避免中断 reconcile。
+     */
+    @Transactional
+    public Plugin upsertFromContent(String url, String body) {
+        String name = extractPluginName(body);
+        if (StringUtils.isBlank(name)) {
+            name = deriveSourceName(url);
+        }
+        DownloadedPlugin downloaded = new DownloadedPlugin(body, name, extractPluginId(body), extractPluginVersion(body));
+
+        Plugin existing = pluginRepository.findByUrl(url).orElse(null);
+        if (existing != null) {
+            applyDownloadedPlugin(existing, downloaded, null, shouldUpdateName(existing));
+            existing.setLastCheckedAt(OffsetDateTime.now());
+            existing.setLastError("");
+            return pluginRepository.save(existing);
+        }
+
+        Plugin plugin = new Plugin();
+        plugin.setUrl(url);
+        applyDownloadedPlugin(plugin, downloaded, null, false);
+        if (StringUtils.isNotBlank(plugin.getExternalId())
+                && pluginRepository.findByExternalId(plugin.getExternalId())
+                        .filter(other -> !url.equals(other.getUrl()))
+                        .isPresent()) {
+            log.warn("externalId [{}] 与现有插件冲突，文件-backed 插件 [{}] 丢弃 externalId", plugin.getExternalId(), url);
+            plugin.setExternalId(null);
+        }
+        plugin.setEnabled(true);
+        plugin.setSortOrder(subscriptionSourceService.nextSortOrder());
+        plugin.setLastCheckedAt(OffsetDateTime.now());
+        plugin.setLastError("");
+        return pluginRepository.save(plugin);
+    }
+
+    /**
+     * 自定义网页源注册(static/webhome/pages/*.html 文件双向同步入口):按 url 匹配 upsert,
+     * 不解析内容、不发起下载;重扫时保留用户改过的名称/开关/顺序,仅新建时用文件名兜底。
+     */
+    @Transactional
+    public Plugin upsertWebPage(String url, String fallbackName) {
+        Plugin existing = pluginRepository.findByUrl(url).orElse(null);
+        if (existing != null) {
+            existing.setLastCheckedAt(OffsetDateTime.now());
+            existing.setLastError("");
+            return pluginRepository.save(existing);
+        }
+        Plugin plugin = new Plugin();
+        plugin.setUrl(url);
+        plugin.setName(StringUtils.defaultIfBlank(fallbackName, deriveSourceName(url)));
+        plugin.setSourceName(plugin.getName());
+        plugin.setEnabled(true);
+        plugin.setSortOrder(subscriptionSourceService.nextSortOrder());
+        plugin.setLastCheckedAt(OffsetDateTime.now());
+        plugin.setLastError("");
+        Plugin saved = pluginRepository.save(plugin);
+        // 新网页源插到插件区最前(内置源之后、其它插件之前),不沉底;重扫已有条目不重排
+        subscriptionSourceService.moveToFrontOfPlugins("plugin-" + saved.getId());
+        return saved;
+    }
+
+    /** 是否为文件-backed 自定义网页源(区别于 spider 插件,站点走 csp_WebHome 形态)。 */
+    public static boolean isWebPagePlugin(Plugin plugin) {
+        return plugin != null && plugin.getUrl() != null && plugin.getUrl().startsWith(WEB_PAGE_URL_PREFIX);
+    }
+
+    /** 网页源站点 key:web_ + 文件路径 sanitized(非 ASCII/特殊字符折叠为 _,空则回落插件 id)。 */
+    public static String webPageSiteKey(Plugin plugin) {
+        String name = StringUtils.removeStart(plugin.getUrl(), WEB_PAGE_URL_PREFIX);
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) {
+            name = name.substring(0, dot);
+        }
+        String key = StringUtils.strip(name.replaceAll("[^A-Za-z0-9_]", "_").replaceAll("_+", "_"), "_");
+        return "web_" + (key.isEmpty() ? String.valueOf(plugin.getId()) : key);
+    }
+
+    /** 网页源页面访问地址:文件身份 /static/webhome/pages/x.html → 访问 /webhome/pages/x.html(no-cache)。 */
+    public static String webPageUrl(Plugin plugin) {
+        return "/webhome/" + StringUtils.removeStart(plugin.getUrl(), STATIC_URL_PREFIX + "webhome/");
     }
 
     @Transactional
@@ -99,19 +214,26 @@ public class PluginService {
         if (urlChanged) {
             validateUrlUniqueness(input.getUrl(), id);
             plugin.setUrl(input.getUrl());
-            applyDownloadedPlugin(plugin, downloadPluginData(input.getUrl()), shouldUpdateName(plugin));
+            applyDownloadedPlugin(plugin, downloadPluginData(input.getUrl()), null, shouldUpdateName(plugin));
+            validateExternalIdUniqueness(plugin.getExternalId(), id);
             plugin.setLastCheckedAt(OffsetDateTime.now());
             plugin.setLastError("");
         }
         plugin.setName(StringUtils.defaultIfBlank(input.getName(), plugin.getSourceName()));
         plugin.setEnabled(input.isEnabled());
         plugin.setExtend(input.getExtend());
-        return pluginRepository.save(plugin);
+        Plugin saved = pluginRepository.save(plugin);
+        applyConfigSchema(saved);
+        return saved;
     }
 
     @Transactional
     public Plugin refresh(Integer id) {
         Plugin plugin = pluginRepository.findById(id).orElseThrow(NotFoundException::new);
+        // 文件-backed 插件直接从磁盘读取，不发起 HTTP 下载
+        if (StringUtils.startsWith(plugin.getUrl(), FILE_PLUGIN_URL_PREFIX)) {
+            return refresh(plugin, readFileBackedPlugin(plugin));
+        }
         return refresh(plugin, null);
     }
 
@@ -130,14 +252,22 @@ public class PluginService {
             if (normalizedPluginUrl == null) {
                 continue;
             }
-            if (!seen.add(normalizedPluginUrl)) {
+            String dedupeKey = StringUtils.trimToNull(entry.externalId());
+            if (dedupeKey == null) {
+                dedupeKey = normalizedPluginUrl;
+            }
+            if (!seen.add(dedupeKey)) {
                 skipped.add(normalizedPluginUrl);
                 continue;
             }
 
             try {
-                Plugin existing = pluginRepository.findByUrl(normalizedPluginUrl).orElse(null);
-                if (existing != null && entry.version() != null && entry.version().equals(existing.getVersion())) {
+                Plugin existing = findExistingPlugin(normalizedPluginUrl, entry.externalId());
+                boolean samePluginType = existing != null
+                        && isPythonPluginUrl(existing.getUrl()) == isPythonPluginUrl(normalizedPluginUrl);
+                if (existing != null && samePluginType
+                        && entry.version() != null && entry.version().equals(existing.getVersion())) {
+                    backfillImportMetadata(existing, normalizedPluginUrl, entry.externalId());
                     skipped.add(normalizedPluginUrl);
                     continue;
                 }
@@ -154,7 +284,8 @@ public class PluginService {
                 if (existing != null) {
                     Plugin plugin = transactionTemplate.execute(status -> {
                         Plugin current = pluginRepository.findById(existing.getId()).orElseThrow(NotFoundException::new);
-                        return refresh(current, downloadedPlugin);
+                        current.setUrl(normalizedPluginUrl);
+                        return refresh(current, downloadedPlugin, entry.externalId());
                     });
                     if (plugin != null && StringUtils.isBlank(plugin.getLastError())) {
                         refreshed.add(plugin.getName());
@@ -162,7 +293,7 @@ public class PluginService {
                         failed.add(normalizedPluginUrl + ": " + (plugin == null ? "刷新失败" : plugin.getLastError()));
                     }
                 } else {
-                    Plugin saved = transactionTemplate.execute(status -> createImportedPlugin(normalizedPluginUrl, downloadedPlugin, entry.valid()));
+                    Plugin saved = transactionTemplate.execute(status -> createImportedPlugin(normalizedPluginUrl, downloadedPlugin, entry.externalId(), entry.valid()));
                     if (saved != null) {
                         created.add(saved.getName());
                     }
@@ -215,11 +346,12 @@ public class PluginService {
         return plugins.size();
     }
 
-    private Plugin createImportedPlugin(String url, DownloadedPlugin downloadedPlugin, boolean enabled) {
+    private Plugin createImportedPlugin(String url, DownloadedPlugin downloadedPlugin, String entryExternalId, boolean enabled) {
         Plugin plugin = new Plugin();
         plugin.setUrl(url);
         validateUrlUniqueness(url, null);
-        applyDownloadedPlugin(plugin, downloadedPlugin, false);
+        applyDownloadedPlugin(plugin, downloadedPlugin, entryExternalId, false);
+        validateExternalIdUniqueness(plugin.getExternalId(), null);
         plugin.setEnabled(enabled);
         plugin.setSortOrder(subscriptionSourceService.nextSortOrder());
         plugin.setLastCheckedAt(OffsetDateTime.now());
@@ -228,8 +360,13 @@ public class PluginService {
     }
 
     private Plugin refresh(Plugin plugin, DownloadedPlugin downloadedPlugin) {
+        return refresh(plugin, downloadedPlugin, null);
+    }
+
+    private Plugin refresh(Plugin plugin, DownloadedPlugin downloadedPlugin, String entryExternalId) {
         try {
-            applyDownloadedPlugin(plugin, downloadedPlugin == null ? downloadPluginData(plugin.getUrl()) : downloadedPlugin, shouldUpdateName(plugin));
+            applyDownloadedPlugin(plugin, downloadedPlugin == null ? downloadPluginData(plugin.getUrl()) : downloadedPlugin, entryExternalId, shouldUpdateName(plugin));
+            validateExternalIdUniqueness(plugin.getExternalId(), plugin.getId());
             plugin.setLastError("");
         } catch (RuntimeException e) {
             plugin.setLastError(e.getMessage());
@@ -245,6 +382,27 @@ public class PluginService {
         return pluginRepository.save(plugin);
     }
 
+    private void backfillImportMetadata(Plugin existing, String url, String externalId) {
+        String id = StringUtils.trimToNull(externalId);
+        boolean urlChanged = !StringUtils.equals(existing.getUrl(), url);
+        boolean externalIdChanged = id != null && !StringUtils.equals(existing.getExternalId(), id);
+        if (!urlChanged && !externalIdChanged) {
+            return;
+        }
+        transactionTemplate.execute(status -> {
+            Plugin plugin = pluginRepository.findById(existing.getId()).orElseThrow(NotFoundException::new);
+            if (urlChanged) {
+                plugin.setUrl(url);
+            }
+            if (externalIdChanged) {
+                plugin.setExternalId(id);
+                validateExternalIdUniqueness(plugin.getExternalId(), plugin.getId());
+            }
+            pluginRepository.save(plugin);
+            return null;
+        });
+    }
+
     private boolean shouldUpdateName(Plugin plugin) {
         return StringUtils.isBlank(plugin.getName()) || StringUtils.equals(plugin.getName(), plugin.getSourceName());
     }
@@ -255,6 +413,29 @@ public class PluginService {
                 throw new BadRequestException("插件地址重复");
             }
         });
+    }
+
+    private void validateExternalIdUniqueness(String externalId, Integer currentId) {
+        String id = StringUtils.trimToNull(externalId);
+        if (id == null) {
+            return;
+        }
+        pluginRepository.findByExternalId(id).ifPresent(other -> {
+            if (currentId == null || !other.getId().equals(currentId)) {
+                throw new BadRequestException("插件ID重复");
+            }
+        });
+    }
+
+    private Plugin findExistingPlugin(String url, String externalId) {
+        String id = StringUtils.trimToNull(externalId);
+        if (id != null) {
+            Plugin existing = pluginRepository.findByExternalId(id).orElse(null);
+            if (existing != null) {
+                return existing;
+            }
+        }
+        return pluginRepository.findByUrl(url).orElse(null);
     }
 
     private String resolveImportSource(String url) {
@@ -276,7 +457,7 @@ public class PluginService {
     }
 
     private List<String> resolveImportCandidates(String url) {
-        String source = StringUtils.trimToEmpty(url);
+        String source = Utils.toAsciiUrl(StringUtils.trimToEmpty(url));
         if (source.isBlank()) {
             throw new BadRequestException("仓库地址不能为空");
         }
@@ -315,19 +496,113 @@ public class PluginService {
     }
 
     private DownloadedPlugin downloadPluginData(String url) {
+        url = Utils.toAsciiUrl(url);
         String body = downloadPlugin(url);
-        return new DownloadedPlugin(body, deriveSourceName(url), extractPluginVersion(body));
+        String name = extractPluginName(body);
+        if (StringUtils.isBlank(name)) {
+            name = deriveSourceName(url);
+        }
+        return new DownloadedPlugin(body, name, extractPluginId(body), extractPluginVersion(body));
     }
 
     private String downloadText(String url, String message) {
-        try {
-            String body = restTemplate.getForObject(URI.create(buildRemoteUrl(url)), String.class);
-            if (StringUtils.isBlank(body)) {
-                throw new BadRequestException(message);
+        url = Utils.toAsciiUrl(url);
+        // Validate URL to prevent SSRF attacks
+        if (!isValidUrl(url)) {
+            throw new BadRequestException("Invalid or unsafe URL: " + url);
+        }
+
+        // 如果不是 GitHub URL，直接下载
+        if (!StringUtils.startsWith(url, "https://github.com/")) {
+            try {
+                String body = restTemplate.getForObject(URI.create(url), String.class);
+                if (StringUtils.isBlank(body)) {
+                    throw new BadRequestException(message);
+                }
+                return body;
+            } catch (Exception e) {
+                throw new BadRequestException(message, e);
             }
-            return body;
-        } catch (Exception e) {
-            throw new BadRequestException(message, e);
+        }
+
+        // GitHub URL - 使用多代理 fallback
+        List<String> proxyList = gitHubProxyService.readProxyListFromFile();
+        Exception lastException = null;
+
+        if (proxyList.isEmpty()) {
+            // 没有配置代理，使用旧逻辑（读取单个代理配置）
+            String proxy = settingRepository.findById(GITHUB_PROXY)
+                    .map(e -> StringUtils.trimToEmpty(e.getValue()))
+                    .orElse("");
+            String finalUrl = proxy.isBlank() ? url : StringUtils.appendIfMissing(proxy, "/") + url;
+            try {
+                String body = restTemplate.getForObject(URI.create(finalUrl), String.class);
+                if (StringUtils.isBlank(body)) {
+                    throw new BadRequestException(message);
+                }
+                return body;
+            } catch (Exception e) {
+                throw new BadRequestException(message, e);
+            }
+        }
+
+        // 使用配置的多代理列表，逐个尝试（最多 5 个）
+        for (int i = 0; i < Math.min(proxyList.size(), 5); i++) {
+            String proxy = proxyList.get(i);
+            String finalUrl;
+
+            if (proxy == null || proxy.trim().isEmpty()) {
+                // 空字符串表示直连
+                finalUrl = url;
+            } else {
+                finalUrl = StringUtils.appendIfMissing(proxy, "/") + url;
+            }
+
+            try {
+                String body = restTemplate.getForObject(URI.create(finalUrl), String.class);
+                if (StringUtils.isNotBlank(body)) {
+                    return body;
+                }
+            } catch (Exception e) {
+                lastException = e;
+                // 继续尝试下一个代理
+            }
+        }
+
+        // 所有代理都失败
+        throw new BadRequestException(message + " (所有代理均失败)", lastException);
+    }
+
+    /**
+     * Validate URL to prevent SSRF attacks
+     * - Only allow HTTP/HTTPS protocols
+     * - Block private IP ranges and localhost
+     * - Block special hostnames
+     */
+    /**
+     * Validate URL to prevent access to obviously dangerous endpoints.
+     * Simplified for private network deployments - only blocks localhost and metadata endpoints.
+     */
+    private boolean isValidUrl(String url) {
+        return Utils.isSafeExternalUrl(url);
+    }
+
+    private DownloadedPlugin readFileBackedPlugin(Plugin plugin) {
+        String body = readFileBackedContent(plugin.getUrl());
+        String name = extractPluginName(body);
+        if (StringUtils.isBlank(name)) {
+            name = deriveSourceName(plugin.getUrl());
+        }
+        return new DownloadedPlugin(body, name, extractPluginId(body), extractPluginVersion(body));
+    }
+
+    private String readFileBackedContent(String url) {
+        String relative = StringUtils.removeStart(url, STATIC_URL_PREFIX);
+        Path file = Utils.getWebPath("static").resolve(relative).normalize();
+        try {
+            return Files.readString(file);
+        } catch (IOException e) {
+            throw new BadRequestException("插件文件读取失败: " + file, e);
         }
     }
 
@@ -340,7 +615,15 @@ public class PluginService {
     }
 
     String deriveSourceName(String url) {
-        String raw = url.substring(url.lastIndexOf('/') + 1);
+        String source = url;
+        try {
+            String path = URI.create(url).getRawPath();
+            if (StringUtils.isNotBlank(path)) {
+                source = path;
+            }
+        } catch (Exception ignored) {
+        }
+        String raw = source.substring(source.lastIndexOf('/') + 1);
         String decoded = URLDecoder.decode(raw, StandardCharsets.UTF_8);
         int dot = decoded.lastIndexOf('.');
         return dot > 0 ? decoded.substring(0, dot) : decoded;
@@ -355,7 +638,7 @@ public class PluginService {
             List<ImportEntry> urls = new ArrayList<>();
             for (JsonNode node : root) {
                 if (node.isTextual()) {
-                    urls.add(new ImportEntry(resolvePluginUrl(sourceUrl, node.asText()), null, true));
+                    urls.add(new ImportEntry(resolvePluginUrl(sourceUrl, node.asText()), null, null, true));
                     continue;
                 }
                 if (node.isObject()) {
@@ -363,9 +646,10 @@ public class PluginService {
                     if (file == null) {
                         throw new BadRequestException(PLUGIN_INDEX_FILE + " 格式不正确");
                     }
+                    String externalId = StringUtils.trimToNull(node.path("id").asText(null));
                     Integer version = node.path("version").canConvertToInt() ? node.path("version").intValue() : null;
                     boolean valid = !node.has("valid") || node.path("valid").asBoolean(true);
-                    urls.add(new ImportEntry(resolvePluginUrl(sourceUrl, file), version, valid));
+                    urls.add(new ImportEntry(resolvePluginUrl(sourceUrl, file), externalId, version, valid));
                     continue;
                 }
                 throw new BadRequestException(PLUGIN_INDEX_FILE + " 格式不正确");
@@ -380,7 +664,7 @@ public class PluginService {
     }
 
     private String resolvePluginUrl(String sourceUrl, String path) {
-        String candidate = StringUtils.trimToEmpty(path);
+        String candidate = Utils.toAsciiUrl(StringUtils.trimToEmpty(path));
         if (candidate.isBlank()) {
             throw new BadRequestException(PLUGIN_INDEX_FILE + " 格式不正确");
         }
@@ -398,6 +682,29 @@ public class PluginService {
         return Integer.parseInt(matcher.group(1));
     }
 
+    private String extractPluginId(String body) {
+        if (StringUtils.isBlank(body)) {
+            return null;
+        }
+        Matcher matcher = PLUGIN_ID.matcher(body);
+        if (matcher.find()) {
+            return StringUtils.trimToNull(matcher.group(1));
+        }
+        matcher = PYTHON_PLUGIN_ID.matcher(body);
+        return matcher.find() ? StringUtils.trimToNull(matcher.group(1)) : null;
+    }
+
+    private String extractPluginName(String body) {
+        if (StringUtils.isBlank(body)) {
+            return null;
+        }
+        Matcher matcher = PLUGIN_NAME.matcher(body);
+        if (!matcher.find()) {
+            return null;
+        }
+        return StringUtils.trimToNull(matcher.group(1));
+    }
+
     private String buildRemoteUrl(String url) {
         if (!StringUtils.startsWith(url, "https://github.com/")) {
             return url;
@@ -411,14 +718,55 @@ public class PluginService {
         return StringUtils.appendIfMissing(proxy, "/") + url;
     }
 
-    private void applyDownloadedPlugin(Plugin plugin, DownloadedPlugin downloadedPlugin, boolean updateName) {
+    static boolean isPythonPluginUrl(String url) {
+        try {
+            String path = URI.create(StringUtils.trimToEmpty(url)).getPath();
+            return StringUtils.endsWithIgnoreCase(path, ".py");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void applyDownloadedPlugin(Plugin plugin, DownloadedPlugin downloadedPlugin, String entryExternalId, boolean updateName) {
         plugin.setSourceName(downloadedPlugin.sourceName());
         if (updateName) {
             plugin.setName(downloadedPlugin.sourceName());
         } else {
             plugin.setName(StringUtils.defaultIfBlank(plugin.getName(), downloadedPlugin.sourceName()));
         }
+        plugin.setExternalId(StringUtils.defaultIfBlank(downloadedPlugin.externalId(), entryExternalId));
         plugin.setContent(downloadedPlugin.body());
         plugin.setVersion(downloadedPlugin.version());
+        applyConfigSchema(plugin);
+    }
+
+    // 从插件脚本内容解析自声明的配置结构并挂到运行时 transient 字段，供前端渲染可视化配置表单。
+    private void applyConfigSchema(Plugin plugin) {
+        if (plugin == null) {
+            return;
+        }
+        plugin.setConfigSchema(buildConfigSchema(plugin.getContent()));
+    }
+
+    private PluginFilterConfigSchema buildConfigSchema(String content) {
+        PluginFilterConfigSchema declared = ConfigSchemaParser.parse(content, PLUGIN_CONFIG_CONST);
+        if (declared != null) {
+            if (StringUtils.isBlank(declared.getDescription())) {
+                declared.setDescription("来自插件脚本内声明");
+            }
+            if (StringUtils.isBlank(declared.getSource())) {
+                declared.setSource("declared");
+            }
+            return declared;
+        }
+        PluginFilterConfigSchema schema = new PluginFilterConfigSchema();
+        schema.setSource("none");
+        schema.setDescription("插件未声明配置结构，可直接输入 JSON");
+        return schema;
+    }
+
+    public PluginFilterConfigSchema readConfigSchema(Integer id) {
+        Plugin plugin = pluginRepository.findById(id).orElseThrow(NotFoundException::new);
+        return buildConfigSchema(plugin.getContent());
     }
 }

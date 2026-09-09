@@ -1,6 +1,8 @@
 package cn.har01d.alist_tvbox.service;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.domain.DriveId;
+import cn.har01d.alist_tvbox.domain.SearchTargets;
 import cn.har01d.alist_tvbox.dto.ShareLink;
 import cn.har01d.alist_tvbox.dto.pansou.MergedLink;
 import cn.har01d.alist_tvbox.dto.pansou.PanSouSearchResponse;
@@ -12,21 +14,19 @@ import cn.har01d.alist_tvbox.entity.TelegramChannelRepository;
 import cn.har01d.alist_tvbox.tvbox.MovieDetail;
 import cn.har01d.alist_tvbox.tvbox.MovieList;
 import cn.har01d.alist_tvbox.util.Utils;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import jakarta.annotation.PostConstruct;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.domain.Sort;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
-import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
@@ -34,21 +34,47 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 public class RemoteSearchService {
+    private static final String CHECK_STATE_OK = "ok";
     private static final String CHECK_STATE_BAD = "bad";
     private static final String CHECK_STATE_UNCERTAIN = "uncertain";
+    private static final Set<String> PAN_SOU_CHECK_TYPES = Set.of(
+            "baidu", "aliyun", "quark", "tianyi", "uc", "mobile", "115", "xunlei", "123");
+
+    // Host fragment -> cloud name, mirrors the ShareService.isValidShareLink domain whitelist.
+    // Used to infer disk_type for plugin requests that only carry a raw share URL.
+    private static final List<String[]> DISK_HOST_MAP = List.of(
+            new String[]{"alipan.com", "aliyun"}, new String[]{"aliyundrive.com", "aliyun"},
+            new String[]{"123pan.com", "123"}, new String[]{"123pan.cn", "123"},
+            new String[]{"123684.com", "123"}, new String[]{"123685.com", "123"}, new String[]{"123865.com", "123"},
+            new String[]{"123912.com", "123"}, new String[]{"123592.com", "123"},
+            new String[]{"123684.cn", "123"}, new String[]{"123685.cn", "123"}, new String[]{"123865.cn", "123"},
+            new String[]{"123912.cn", "123"}, new String[]{"123592.cn", "123"},
+            new String[]{"guangyapan.com", "guangya"},
+            new String[]{"mypikpak.com", "pikpak"},
+            new String[]{"xunlei.com", "xunlei"},
+            new String[]{"quark.cn", "quark"},
+            new String[]{"139.com", "mobile"},
+            new String[]{"uc.cn", "uc"},
+            new String[]{"115.com", "115"}, new String[]{"115cdn.com", "115"}, new String[]{"anxia.com", "115"},
+            new String[]{"189.cn", "tianyi"},
+            new String[]{"baidu.com", "baidu"});
 
     private final AppProperties appProperties;
     private final RestTemplate restTemplate;
@@ -57,10 +83,17 @@ public class RemoteSearchService {
     private final ShareService shareService;
     private final TvBoxService tvBoxService;
     private final OfflineDownloadService offlineDownloadService;
+    private final SubscriptionSourceService subscriptionSourceService;
+    private final PanSouClient panSouClient;
+    private final PanLinkCheckService panLinkCheckService;
     private List<String> panSouDefaultChannels;
     private List<String> panSouBuiltinChannels;
-    private String panSouToken;
-    private String checkedPanSouUrl;
+    // holds one grouped search result set per short cache id so the folder
+    // drill-down can page through it without hitting PanSou again.
+    private final Cache<String, List<Message>> groupCache = Caffeine.newBuilder()
+            .expireAfterWrite(Duration.ofMinutes(15))
+            .maximumSize(20)
+            .build();
 
     public RemoteSearchService(AppProperties appProperties,
                                RestTemplateBuilder restTemplateBuilder,
@@ -68,7 +101,10 @@ public class RemoteSearchService {
                                TelegramChannelRepository telegramChannelRepository,
                                ShareService shareService,
                                TvBoxService tvBoxService,
-                               OfflineDownloadService offlineDownloadService) {
+                               OfflineDownloadService offlineDownloadService,
+                               SubscriptionSourceService subscriptionSourceService,
+                               PanSouClient panSouClient,
+                               PanLinkCheckService panLinkCheckService) {
         this.appProperties = appProperties;
         this.restTemplate = restTemplateBuilder.build();
         this.objectMapper = objectMapper;
@@ -76,53 +112,18 @@ public class RemoteSearchService {
         this.shareService = shareService;
         this.tvBoxService = tvBoxService;
         this.offlineDownloadService = offlineDownloadService;
+        this.subscriptionSourceService = subscriptionSourceService;
+        this.panSouClient = panSouClient;
+        this.panLinkCheckService = panLinkCheckService;
     }
 
-    @PostConstruct
-    public void setup() {
-        refreshPanSouInfoAsync();
-    }
-
+    /** PanSou 健康信息(供 /api/pansou 展示):健康/auth/频道来自 {@link PanSouClient},补充项目频道数。 */
     public ObjectNode getPanSouInfo() {
-        String url = appProperties.getPanSouUrl();
-        ObjectNode info = restTemplate.getForObject(url + "/api/health", ObjectNode.class);
+        ObjectNode info = panSouClient.getPanSouInfo();
         if (info != null) {
-            checkedPanSouUrl = StringUtils.defaultString(url);
-            updatePanSouAuthEnabled(info);
             info.put("project_channels_count", getProjectChannels().size());
         }
         return info;
-    }
-
-    public void refreshPanSouInfoAsync() {
-        String url = appProperties.getPanSouUrl();
-        checkedPanSouUrl = StringUtils.defaultString(url);
-        if (StringUtils.isBlank(url)) {
-            appProperties.setPanSouAuthEnabled(null);
-            return;
-        }
-        appProperties.setPanSouAuthEnabled(null);
-        CompletableFuture.runAsync(() -> {
-            try {
-                getPanSouInfo();
-            } catch (Exception e) {
-                log.warn("check PanSou health failed: {}", url, e);
-                appProperties.setPanSouAuthEnabled(null);
-            }
-        });
-    }
-
-    private void refreshPanSouInfoIfUrlChanged() {
-        String url = appProperties.getPanSouUrl();
-        if (checkedPanSouUrl != null && !StringUtils.equals(StringUtils.defaultString(url), checkedPanSouUrl)) {
-            refreshPanSouInfoAsync();
-        }
-    }
-
-    private void updatePanSouAuthEnabled(ObjectNode info) {
-        if (info.has("auth_enabled")) {
-            appProperties.setPanSouAuthEnabled(info.get("auth_enabled").asBoolean(false));
-        }
     }
 
     public MovieList pansou(String keyword) {
@@ -130,29 +131,14 @@ public class RemoteSearchService {
         var result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
 
-        List<String> channels = telegramChannelRepository.findByEnabledTrue(Sort.by("order")).stream()
+        List<String> channels = telegramChannelRepository.findByEnabledTrue(Sort.by("sortOrder")).stream()
                 .filter(TelegramChannel::isValid)
                 .map(TelegramChannel::getUsername)
                 .toList();
 
-        var messages = search(keyword, channels);
+        var messages = search(keyword, channels, "csp_FishPanSou");
         for (var message : messages) {
-            var movieDetail = new MovieDetail();
-            movieDetail.setVod_id(encodeUrl(message.getLink()));
-            movieDetail.setVod_name(message.getName());
-            if (StringUtils.isBlank(message.getCover())) {
-                movieDetail.setVod_pic(getPic(message.getType()));
-            } else {
-                movieDetail.setVod_pic(message.getCover());
-            }
-            movieDetail.setVod_remarks(getTypeName(message.getType()));
-            movieDetail.setVod_play_from(message.getChannel());
-            if (message.getTime() != null) {
-                movieDetail.setVod_time(message.getTime().toString());
-            }
-            movieDetail.setValidity_state(message.getValidityState());
-            movieDetail.setValidity_summary(message.getValiditySummary());
-            list.add(movieDetail);
+            list.add(toMovieDetail(message));
         }
 
         result.setList(list);
@@ -164,24 +150,212 @@ public class RemoteSearchService {
         return result;
     }
 
+    private MovieDetail toMovieDetail(Message message) {
+        var movieDetail = new MovieDetail();
+        movieDetail.setVod_id(encodeUrl(message.getLink()));
+        movieDetail.setVod_name(message.getName());
+        if (StringUtils.isNotBlank(message.getLink()) && StringUtils.isNotBlank(movieDetail.getVod_name())) {
+            shareService.cacheShareTitle(message.getLink(), movieDetail.getVod_name());
+        }
+        if (StringUtils.isBlank(message.getCover())) {
+            movieDetail.setVod_pic(getPic(message.getType()));
+        } else {
+            movieDetail.setVod_pic(message.getCover());
+        }
+        movieDetail.setVod_remarks(getTypeName(message.getType()));
+        movieDetail.setVod_play_from(message.getChannel());
+        if (message.getTime() != null) {
+            movieDetail.setVod_time(message.getTime().toString());
+        }
+        movieDetail.setValidity_state(message.getValidityState());
+        movieDetail.setValidity_summary(message.getValiditySummary());
+        return movieDetail;
+    }
+
+    public MovieList pansouGroup(String keyword) {
+        long start = System.currentTimeMillis();
+        List<String> channels = telegramChannelRepository.findByEnabledTrue(Sort.by("sortOrder")).stream()
+                .filter(TelegramChannel::isValid)
+                .map(TelegramChannel::getUsername)
+                .toList();
+        List<Message> messages = search(keyword, channels, "csp_FishPanSouGroup");
+        String cacheId = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        groupCache.put(cacheId, messages);
+
+        // seed with the configured driver order so folders follow the user's preferred order
+        Map<String, List<Message>> byType = new LinkedHashMap<>();
+        for (String type : appProperties.getTgDriverOrder()) {
+            byType.put(type, new ArrayList<>());
+        }
+        for (Message message : messages) {
+            byType.computeIfAbsent(message.getType(), key -> new ArrayList<>()).add(message);
+        }
+
+        List<MovieDetail> folders = new ArrayList<>();
+        for (var entry : byType.entrySet()) {
+            if (entry.getValue().isEmpty()) {
+                continue;
+            }
+            String type = entry.getKey();
+            String typeName = getTypeName(type);
+            var folder = new MovieDetail();
+            folder.setVod_id("pgroup:" + cacheId + ":" + type);
+            folder.setVod_name((typeName == null ? type : typeName) + "网盘");
+            folder.setVod_pic(getPic(type));
+            folder.setVod_remarks(entry.getValue().size() + "条结果");
+            folder.setVod_tag("folder");
+            folders.add(folder);
+        }
+
+        var result = new MovieList();
+        result.setList(folders);
+        result.setTotal(folders.size());
+        result.setLimit(folders.size());
+        log.info("Grouped search {} get {} disk types from PanSou elapsed {} ms.", keyword, folders.size(), System.currentTimeMillis() - start);
+        return result;
+    }
+
+    public MovieList pansouGroupList(String tid, int pg) {
+        int page = Math.max(1, pg);
+        String rest = tid.startsWith("pgroup:") ? tid.substring("pgroup:".length()) : "";
+        int sep = rest.indexOf(':');
+        if (sep < 0) {
+            return emptyGroupList(page);
+        }
+        String cacheId = rest.substring(0, sep);
+        String type = rest.substring(sep + 1);
+        List<Message> messages = groupCache.getIfPresent(cacheId);
+        if (messages == null) {
+            log.info("grouped search cache {} expired", cacheId);
+            return emptyGroupList(page);
+        }
+        List<MovieDetail> all = messages.stream()
+                .filter(message -> type.equals(message.getType()))
+                .map(this::toMovieDetail)
+                .toList();
+        int size = 20;
+        int from = Math.min((page - 1) * size, all.size());
+        int to = Math.min(from + size, all.size());
+        List<MovieDetail> pageItems = new ArrayList<>(all.subList(from, to));
+
+        var result = new MovieList();
+        result.setList(pageItems);
+        result.setPage(page);
+        result.setPagecount(Math.max(1, (int) Math.ceil(all.size() / (double) size)));
+        result.setLimit(pageItems.size());
+        result.setTotal(all.size());
+        return result;
+    }
+
+    private MovieList emptyGroupList(int page) {
+        var result = new MovieList();
+        result.setList(new ArrayList<>());
+        result.setPage(page);
+        result.setPagecount(1);
+        result.setLimit(0);
+        result.setTotal(0);
+        return result;
+    }
+
     public MovieList detail(String tid) {
+        return detail(tid, null, null);
+    }
+
+    public MovieList detail(String tid, String title, String keyword) {
         var share = new ShareLink();
         share.setLink(tid);
         String path = shareService.add(share);
 
-        return tvBoxService.getDetail("", "1$" + path + "/~playlist");
+        // Recover the real title so getPlaylist does not fall back to the obfuscated
+        // storage folder name (which also breaks metadata scraping). resolveShareTitle
+        // checks caller param -> shared in-memory search cache -> persisted Share.title.
+        String resolved = shareService.resolveShareTitle(tid, title);
+        return tvBoxService.getDetail("", "1$" + path + "/~playlist", resolved, keyword, 0);
+    }
+
+    // Per-built-in-source override parsed from the builtin extend JSON
+    // ({"source":..,"filter_include":..,"filter_exclude":..}); null when no siteKey
+    // or no extend configured, so callers fall back to global AppProperties values.
+    private JsonNode pansouSourceConfig(String siteKey) {
+        if (siteKey == null) {
+            return null;
+        }
+        String extend = subscriptionSourceService.getBuiltinExtend(siteKey);
+        if (StringUtils.isBlank(extend)) {
+            return null;
+        }
+        try {
+            JsonNode node = objectMapper.readTree(extend);
+            return node.isObject() ? node : null;
+        } catch (Exception e) {
+            log.debug("invalid pansou source extend for {}: {}", siteKey, extend);
+            return null;
+        }
+    }
+
+    private String resolvePanSouSource(JsonNode config) {
+        String override = config == null ? "" : config.path("source").asText("");
+        return StringUtils.isNotBlank(override) ? override : appProperties.getPanSouSource();
+    }
+
+    private List<String> resolvePanSouFilterInclude(JsonNode config) {
+        return resolvePanSouFilter(config, "filter_include", appProperties.getPanSouFilterInclude());
+    }
+
+    private List<String> resolvePanSouFilterExclude(JsonNode config) {
+        return resolvePanSouFilter(config, "filter_exclude", appProperties.getPanSouFilterExclude());
+    }
+
+    // per-field inherit: a non-blank override wins, otherwise fall back to the global value
+    private List<String> resolvePanSouFilter(JsonNode config, String field, List<String> globalValue) {
+        String csv = config == null ? "" : config.path(field).asText("");
+        if (StringUtils.isBlank(csv)) {
+            return globalValue;
+        }
+        return Arrays.stream(csv.split(",")).map(String::trim)
+                .filter(StringUtils::isNotBlank).toList();
     }
 
     public List<Message> search(String keyword, List<String> channels) {
-        var request = new SearchRequest(keyword, getSearchChannels(channels), appProperties.getPanSouSource());
+        return doSearch(keyword, channels, null, null);
+    }
+
+    /** 追剧口径:盘搜按订阅定向集({@link SearchTargets})服务端定向 + 结果本地门禁,null = 观影全局口径。 */
+    public List<Message> search(String keyword, List<String> channels, SearchTargets targets) {
+        return doSearch(keyword, channels, null, targets);
+    }
+
+    public List<Message> search(String keyword, List<String> channels, String siteKey) {
+        return doSearch(keyword, channels, siteKey, null);
+    }
+
+    private List<Message> doSearch(String keyword, List<String> channels, String siteKey, SearchTargets targets) {
+        JsonNode sourceConfig = pansouSourceConfig(siteKey);
+        var request = new SearchRequest(keyword, getSearchChannels(channels), resolvePanSouSource(sourceConfig));
         request.setExt(Map.of("referer", "https://dm.xueximeng.com"));
         boolean offlineDownloadEnabled = offlineDownloadService.getConfig().enabled();
         if (StringUtils.isNotBlank(keyword)) {
-//            request.setFilter(new SearchRequest.Filter(List.of(keyword), List.of()));
-            request.setCloudTypes(getPanSouCloudTypes(offlineDownloadEnabled));
+            List<String> cloudTypes = resolveCloudTypes(targets);
+            if (!cloudTypes.isEmpty()) {
+                request.setCloudTypes(cloudTypes);
+            }
         }
         if (!CollectionUtils.isEmpty(appProperties.getPanSouPlugins())) {
             request.setPlugins(appProperties.getPanSouPlugins());
+        }
+        if (appProperties.getPanSouConc() != null && appProperties.getPanSouConc() > 0) {
+            request.setConc(appProperties.getPanSouConc());
+        }
+        if (Boolean.TRUE.equals(appProperties.getPanSouRefresh())) {
+            request.setRefresh(true);
+        }
+        //request.setRes(StringUtils.defaultIfBlank(appProperties.getPanSouRes(), "merge"));
+        List<String> filterInclude = resolvePanSouFilterInclude(sourceConfig);
+        List<String> filterExclude = resolvePanSouFilterExclude(sourceConfig);
+        if (!CollectionUtils.isEmpty(filterInclude) || !CollectionUtils.isEmpty(filterExclude)) {
+            request.setFilter(new SearchRequest.Filter(
+                    CollectionUtils.isEmpty(filterInclude) ? List.of() : filterInclude,
+                    CollectionUtils.isEmpty(filterExclude) ? List.of() : filterExclude));
         }
         String url = appProperties.getPanSouUrl() + "/api/search";
         log.debug("search request: {} {}", url, request);
@@ -189,7 +363,7 @@ public class RemoteSearchService {
             var json = searchPanSou(url, request);
             var response = objectMapper.readValue(json, PanSouSearchResponse.class);
             List<Message> messages = new ArrayList<>();
-            addMergedMessages(response.getSearchResponse().getMergedByType(), keyword, offlineDownloadEnabled, messages);
+            addMergedMessages(response.getSearchResponse().getMergedByType(), keyword, offlineDownloadEnabled, messages, targets);
             if (!messages.isEmpty()) {
                 return filterInvalidPanSouLinks(messages.stream().sorted(comparator()).distinct().toList());
             }
@@ -198,7 +372,6 @@ public class RemoteSearchService {
             if (results == null) {
                 return messages;
             }
-            List<String> tgDrivers = appProperties.getTgDrivers();
             for (var result : results) {
                 if (!isMatched(result, keyword)) {
                     log.debug("ignore PanSou result '{}' because it does not match keyword '{}'", result.getTitle(), keyword);
@@ -213,7 +386,7 @@ public class RemoteSearchService {
                         continue;
                     }
                     var message = new Message(result, link);
-                    if (tgDrivers.isEmpty() || tgDrivers.contains(message.getType())) {
+                    if (resultTypeAllowed(message.getType(), targets)) {
                         messages.add(message);
                     }
                 }
@@ -224,162 +397,76 @@ public class RemoteSearchService {
         }
     }
 
-    private List<Message> filterInvalidPanSouLinks(List<Message> messages) {
-        if (!appProperties.isPanSouLinkCheckEnabled() || messages.isEmpty()) {
-            return messages;
+    /**
+     * 盘搜 cloud_types 定向:盘白名单非空按白名单映射,否则全局 tg.drivers(现状);磁力兜底生效
+     * 追加 magnet/ed2k。pan 部分为空返回空表(不发送 —— 不限模式服务端本就返回离线类型,
+     * 单发离线列表会把网盘结果裁光)。
+     */
+    private List<String> resolveCloudTypes(SearchTargets targets) {
+        List<String> base;
+        if (targets != null && !targets.drives().isEmpty()) {
+            base = targets.drives().stream()
+                    .map(DriveId::toTypeLeniently)
+                    .filter(Objects::nonNull)
+                    .map(type -> PanSouClient.cloudType(String.valueOf(type)))
+                    .filter(StringUtils::isNotBlank)
+                    .distinct()
+                    .toList();
+        } else {
+            base = getPanSouCloudTypes();
         }
-        List<Message> checkable = messages.stream()
-                .filter(message -> !isOfflineDownloadType(message.getType()))
-                .filter(message -> StringUtils.isNotBlank(getPanSouCloudType(message.getType())))
-                .toList();
-        if (checkable.isEmpty() || checkable.size() > appProperties.getPanSouLinkCheckMaxCount()) {
-            return messages;
+        if (base.isEmpty() || targets == null || !targets.offlineIncluded()) {
+            return base;
         }
-
-        Map<String, String> states = new java.util.HashMap<>();
-        Map<String, String> summaries = new java.util.HashMap<>();
-        Map<String, List<Message>> groups = checkable.stream()
-                .collect(Collectors.groupingBy(message -> getPanSouCloudType(message.getType())));
-        List<CompletableFuture<ObjectNode>> futures = groups.entrySet().stream()
-                .map(entry -> CompletableFuture.supplyAsync(() -> {
-                    long startedAt = System.currentTimeMillis();
-                    try {
-                        ObjectNode response = checkPanSouLinks(buildPanSouLinkCheckRequest(entry.getKey(), entry.getValue()));
-                        logPanSouLinkCheck(entry.getKey(), entry.getValue().size(), response, startedAt);
-                        return response;
-                    } catch (Exception e) {
-                        log.warn("check PanSou search links failed: {}", entry.getKey(), e);
-                        return null;
-                    }
-                }))
-                .toList();
-        for (CompletableFuture<ObjectNode> future : futures) {
-            ObjectNode response = future.join();
-            if (response == null || !response.has("results") || !response.get("results").isArray()) {
-                continue;
-            }
-            response.get("results").forEach(result -> {
-                if (result.has("url") && result.has("state")) {
-                    String url = result.get("url").asText();
-                    states.put(url, result.get("state").asText());
-                    if (result.has("summary")) {
-                        summaries.put(url, result.get("summary").asText());
-                    }
-                }
-            });
+        List<String> withOffline = new ArrayList<>(base);
+        if (!withOffline.contains("magnet")) {
+            withOffline.add("magnet");
         }
-        if (states.isEmpty()) {
-            return messages;
+        if (!withOffline.contains("ed2k")) {
+            withOffline.add("ed2k");
         }
-        return messages.stream()
-                .filter(message -> !isInvalidPanSouCheckState(states.get(message.getLink())))
-                .peek(message -> {
-                    if (states.containsKey(message.getLink())) {
-                        String state = states.get(message.getLink());
-                        message.setValidityState(state);
-                        message.setValiditySummary(StringUtils.defaultIfBlank(summaries.get(message.getLink()), getPanSouLinkStateSummary(state)));
-                    }
-                })
-                .toList();
+        return withOffline;
     }
 
-    private boolean isInvalidPanSouCheckState(String state) {
-        return CHECK_STATE_BAD.equals(state) || CHECK_STATE_UNCERTAIN.equals(state);
+    /**
+     * 结果本地盘门禁:定向集(null = 观影全局口径)——盘白名单非空时替换全局 tg.drivers
+     * (订阅生效盘优先);白名单空时网盘维持现状;离线类型不在此收口(telegram 聚合出口的
+     * 定向门禁统一裁决)。targets==null 逐字保留两条路径的存量差异(merged 恒放行离线,
+     * results 按 tg.drivers)。
+     */
+    private boolean mergedTypeAllowed(String messageType, SearchTargets targets) {
+        if (targets == null) {
+            List<String> tgDrivers = appProperties.getTgDrivers();
+            return isOfflineDownloadType(messageType) || tgDrivers.isEmpty() || tgDrivers.contains(messageType);
+        }
+        if (SearchTargets.isOfflineType(messageType)) {
+            return true;
+        }
+        if (targets.drives().isEmpty()) {
+            List<String> tgDrivers = appProperties.getTgDrivers();
+            return tgDrivers.isEmpty() || tgDrivers.contains(messageType);
+        }
+        return targets.allowsDrive(messageType);
     }
 
-    private String getPanSouLinkStateSummary(String state) {
-        if ("locked".equals(state)) {
-            return "链接受限";
+    private boolean resultTypeAllowed(String messageType, SearchTargets targets) {
+        if (targets == null) {
+            List<String> tgDrivers = appProperties.getTgDrivers();
+            return tgDrivers.isEmpty() || tgDrivers.contains(messageType);
         }
-        return "链接有效";
+        return mergedTypeAllowed(messageType, targets);
     }
 
-    private ObjectNode buildPanSouLinkCheckRequest(String diskType, List<Message> messages) {
-        ObjectNode request = objectMapper.createObjectNode();
-        ArrayNode items = request.putArray("items");
-        for (Message message : messages) {
-            items.addObject()
-                    .put("disk_type", diskType)
-                    .put("url", message.getLink());
-        }
-        request.put("view_token", "pansou-search-" + diskType + "-" + System.currentTimeMillis());
-        return request;
-    }
-
-    private void logPanSouLinkCheck(String diskType, int inputCount, ObjectNode response, long startedAt) {
-        long validCount = 0;
-        if (response != null && response.has("results") && response.get("results").isArray()) {
-            for (var result : response.get("results")) {
-                if (result.has("state") && "ok".equals(result.get("state").asText())) {
-                    validCount++;
-                }
-            }
-        }
-        log.info("检测{}网盘链接{}条，{}条有效，耗时{}ms", diskType, inputCount, validCount, System.currentTimeMillis() - startedAt);
+    /** 盘检过滤(搜索即过滤):bad/uncertain 剔除、ok/locked 盖 validityState —— 实现在 {@link PanLinkCheckService}。 */
+    public List<Message> filterInvalidPanSouLinks(List<Message> messages) {
+        return panLinkCheckService.filterInvalidPanSouLinks(messages);
     }
 
     private String searchPanSou(String url, SearchRequest request) {
-        if (!shouldUsePanSouAuth()) {
-            return restTemplate.postForObject(url, request, String.class);
-        }
-        String token = getPanSouToken();
-        if (StringUtils.isBlank(token)) {
-            return restTemplate.postForObject(url, request, String.class);
-        }
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        return restTemplate.exchange(url, HttpMethod.POST, new HttpEntity<>(request, headers), String.class).getBody();
+        return panSouClient.post(url, request, String.class);
     }
 
-    public ObjectNode checkPanSouLinks(ObjectNode request) {
-        String url = appProperties.getPanSouUrl() + "/api/check/links";
-        if (!shouldUsePanSouAuth()) {
-            return restTemplate.postForObject(url, request, ObjectNode.class);
-        }
-        String token = getPanSouToken();
-        if (StringUtils.isBlank(token)) {
-            return restTemplate.postForObject(url, request, ObjectNode.class);
-        }
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        return restTemplate.exchange(url, HttpMethod.POST, new HttpEntity<>(request, headers), ObjectNode.class).getBody();
-    }
-
-    private boolean hasPanSouCredentials() {
-        return StringUtils.isNoneBlank(appProperties.getPanSouUsername(), appProperties.getPanSouPassword());
-    }
-
-    private boolean shouldUsePanSouAuth() {
-        refreshPanSouInfoIfUrlChanged();
-        return hasPanSouCredentials() && Boolean.TRUE.equals(appProperties.getPanSouAuthEnabled());
-    }
-
-    private String getPanSouToken() {
-        if (StringUtils.isNotBlank(panSouToken)) {
-            return panSouToken;
-        }
-        Map<String, String> body = Map.of(
-                "username", appProperties.getPanSouUsername(),
-                "password", appProperties.getPanSouPassword());
-        Map<?, ?> response;
-        try {
-            response = restTemplate.postForObject(appProperties.getPanSouUrl() + "/api/auth/login", body, Map.class);
-        } catch (HttpClientErrorException.Forbidden e) {
-            if (e.getResponseBodyAsString().contains("认证功能未启用")) {
-                log.info("PanSou auth is disabled, use unauthenticated requests");
-                appProperties.setPanSouAuthEnabled(false);
-                return "";
-            }
-            throw e;
-        }
-        if (response == null || response.get("token") == null) {
-            throw new IllegalStateException("PanSou login failed");
-        }
-        panSouToken = response.get("token").toString();
-        return panSouToken;
-    }
-
-    private List<String> getSearchChannels(List<String> channels) {
+    List<String> getSearchChannels(List<String> channels) {
         return switch (appProperties.getPanSouChannels()) {
             case "project" -> getProjectChannels();
             case "pansou" -> getPanSouBuiltinChannels();
@@ -396,7 +483,7 @@ public class RemoteSearchService {
 
     private List<String> getPanSouBuiltinChannels() {
         if (panSouBuiltinChannels == null) {
-            ObjectNode info = getPanSouInfo();
+            ObjectNode info = panSouClient.getPanSouInfo();
             if (info == null || !info.has("channels") || !info.get("channels").isArray()) {
                 return List.of();
             }
@@ -429,17 +516,17 @@ public class RemoteSearchService {
         }
     }
 
-    private void addMergedMessages(Map<String, List<MergedLink>> mergedByType, String keyword, boolean offlineDownloadEnabled, List<Message> messages) {
+    private void addMergedMessages(Map<String, List<MergedLink>> mergedByType, String keyword, boolean offlineDownloadEnabled,
+                                   List<Message> messages, SearchTargets targets) {
         if (CollectionUtils.isEmpty(mergedByType)) {
             return;
         }
-        List<String> tgDrivers = appProperties.getTgDrivers();
         for (var entry : mergedByType.entrySet()) {
-            if (!offlineDownloadEnabled && isOfflineDownloadType(entry.getKey())) {
-                continue;
-            }
+//            if (!offlineDownloadEnabled && isOfflineDownloadType(entry.getKey())) {
+//                continue;
+//            }
             String messageType = getMessageType(entry.getKey());
-            if (messageType == null || !isEnabledDriver(messageType, tgDrivers)) {
+            if (messageType == null || !mergedTypeAllowed(messageType, targets)) {
                 continue;
             }
             for (var link : entry.getValue()) {
@@ -450,10 +537,6 @@ public class RemoteSearchService {
                 messages.add(new Message(messageType, link));
             }
         }
-    }
-
-    private boolean isEnabledDriver(String messageType, List<String> tgDrivers) {
-        return isOfflineDownloadType(messageType) || tgDrivers.isEmpty() || tgDrivers.contains(messageType);
     }
 
     private boolean isOfflineDownloadType(String type) {
@@ -502,30 +585,17 @@ public class RemoteSearchService {
                 && text.toLowerCase(Locale.ROOT).contains(token.toLowerCase(Locale.ROOT));
     }
 
-    private String getPanSouCloudType(String type) {
-        if (type == null) {
-            return null;
-        }
-        return switch (type) {
-            case "0" -> "aliyun";
-            case "1" -> "pikpak";
-            case "2" -> "xunlei";
-            case "3" -> "123";
-            case "5" -> "quark";
-            case "6" -> "mobile";
-            case "7" -> "uc";
-            case "8" -> "115";
-            case "9" -> "tianyi";
-            case "10" -> "baidu";
-            case "magnet" -> "magnet";
-            case "ed2k" -> "ed2k";
-            default -> null;
-        };
+    private List<String> getPanSouCloudTypes() {
+        return new ArrayList<>(appProperties.getTgDrivers().stream()
+                .map(PanSouClient::cloudType)
+                .filter(StringUtils::isNotBlank)
+                .distinct()
+                .toList());
     }
 
     private List<String> getPanSouCloudTypes(boolean offlineDownloadEnabled) {
         List<String> types = new ArrayList<>(appProperties.getTgDrivers().stream()
-                .map(this::getPanSouCloudType)
+                .map(PanSouClient::cloudType)
                 .filter(type -> offlineDownloadEnabled || !isOfflineDownloadType(type))
                 .filter(StringUtils::isNotBlank)
                 .distinct()
@@ -553,6 +623,7 @@ public class RemoteSearchService {
             case "115" -> "8";
             case "tianyi" -> "9";
             case "baidu" -> "10";
+            case "guangya" -> "12";
             case "magnet" -> "magnet";
             case "ed2k" -> "ed2k";
             default -> null;
@@ -611,6 +682,7 @@ public class RemoteSearchService {
             case "8" -> "115";
             case "9" -> "天翼";
             case "10" -> "百度";
+            case "12" -> "光鸭";
             case "aliyun" -> "阿里";
             case "pikpak" -> "PikPak";
             case "xunlei" -> "迅雷";
@@ -621,6 +693,7 @@ public class RemoteSearchService {
             case "115" -> "115";
             case "tianyi" -> "天翼";
             case "baidu" -> "百度";
+            case "guangya" -> "光鸭";
             case "magnet" -> "磁力";
             case "ed2k" -> "ED2K";
             default -> null;
@@ -642,6 +715,7 @@ public class RemoteSearchService {
             case "9" -> getUrl("/189.png");
             case "6" -> getUrl("/139.jpg");
             case "10" -> getUrl("/baidu.jpg");
+            case "12" -> getUrl("/guangya.webp");
             case "magnet" -> getUrl("/magnet.png");
             case "ed2k" -> getUrl("/ed2k.jpg");
             default -> null;

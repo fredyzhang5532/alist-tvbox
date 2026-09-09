@@ -1,5 +1,8 @@
 <template>
-  <div id="config">
+  <div class="page-container">
+    <div class="page-header">
+      <h1 class="page-title">系统配置</h1>
+    </div>
     <el-row>
       <el-col :xs="23" :sm="23" :md="23" :lg="11" :xl="11">
         <el-card class="box-card">
@@ -66,6 +69,15 @@
               />
               <span class="hint">建议外网开启，多个安全Token，逗号分割。</span>
             </el-form-item>
+            <el-form-item prop="anonymousAccess" label="亲友共享">
+              <el-switch
+                v-model="form.anonymousAccess"
+                inline-prompt
+                active-text="开启"
+                inactive-text="关闭"
+              />
+              <span class="hint">开启安全订阅后，无Token的旧订阅地址仍可访问，且配置内自动注入首个安全Token，亲友无需改地址。</span>
+            </el-form-item>
             <el-form-item prop="token" label="安全Token">
               <el-input v-model="form.token" type="password" show-password/>
             </el-form-item>
@@ -97,7 +109,7 @@
             </div>
           </template>
           <div v-if="appVersion">应用版本：{{ appVersion }}</div>
-          <div v-if="appRemoteVersion&&appRemoteVersion>appVersion">
+          <div v-if="appRemoteVersion&&compareVersion(appRemoteVersion,appVersion)>0">
             <el-tooltip
               class="box-item"
               effect="dark"
@@ -109,7 +121,7 @@
             <div class="changelog" v-if="changelog">更新日志： {{ changelog }}</div>
           </div>
           <div v-if="aListVersion">AList版本：{{ aListVersion }}</div>
-          <div v-if="aListRemoteVersion&&aListRemoteVersion>aListVersion">
+          <div v-if="aListRemoteVersion&&compareVersion(aListRemoteVersion,aListVersion)>0">
             <el-tooltip
               class="box-item"
               effect="dark"
@@ -147,7 +159,7 @@
             </el-form-item>
           </el-form>
           <div>本地版本：<a href="/#/meta">{{ movieVersion }}</a></div>
-          <div v-if="movieRemoteVersion&&movieRemoteVersion>movieVersion">
+          <div v-if="movieRemoteVersion&&compareVersion(movieRemoteVersion,movieVersion)>0">
             最新版本：{{
               movieRemoteVersion
             }}，后台更新中。
@@ -173,6 +185,9 @@
     </el-row>
 
     <el-dialog id="adv" v-model="dialogVisible" title="高级设置" width="60%">
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+        网盘相关配置(分享免转存、跨网盘秒传、账号·转存策略、分享校验·清理)已移动到「网盘账号」页面的「配置」对话框中。
+      </el-alert>
       <el-form label-width="180px">
         <el-form-item label="开放Token认证URL">
           <el-select v-model="openTokenUrl" class="m-2" placeholder="Select">
@@ -202,6 +217,28 @@
         <el-form-item label="TMDB API Key">
           <el-input v-model="tmdbApiKey" type="password" show-password/>
           <el-button type="primary" @click="updateTmdbApiKey">更新</el-button>
+          <span class="hint" style="margin-left: 8px">v3 api key(32 位)或 v4 read access token(eyJ 开头)自动识别;
+            <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">到官网获取 →</a>
+          </span>
+        </el-form-item>
+        <el-form-item label="TMDB 代理">
+          <el-select v-model="tmdbApiHost" style="width: 320px"
+                    filterable allow-create default-first-option
+                    placeholder="选择预设,或输入自定义 CF Worker 反代地址">
+            <el-option v-for="opt in tmdbApiHostOptions" :key="opt.value" :label="opt.label" :value="opt.value"/>
+          </el-select>
+          <el-button type="primary" class="hint" @click="updateTmdbApiHost">更新</el-button>
+          <span class="hint" style="margin-left: 8px">可以手动输入代理地址，立即生效;多个地址逗号分隔自动轮询;
+            <a href="/tmdb_proxy_worker.js" target="_blank" rel="noopener">自建 Worker 参考代码 →</a>
+          </span>
+        </el-form-item>
+        <el-form-item label="115分享本地索引" v-if="has115Account">
+          <el-button type="primary" :loading="index115Loading" @click="updateIndex115">下载</el-button>
+          <el-tag v-if="index115Checking" type="info" style="margin-left: 8px">检查中</el-tag>
+          <el-tag v-else-if="index115Check.error" type="danger" style="margin-left: 8px">检查失败</el-tag>
+          <el-tag v-else-if="index115Check.hasUpdate" type="warning" style="margin-left: 8px">有更新</el-tag>
+          <el-tag v-else type="success" style="margin-left: 8px">已是最新</el-tag>
+          <span class="hint" style="margin-left: 8px">当前: {{ index115Check.localVersion || '未下载' }}　最新: {{ index115Check.remoteVersion || '-' }}</span>
         </el-form-item>
         <el-form-item label="User Agent">
           <el-input v-model="userAgent"/>
@@ -216,6 +253,11 @@
         <el-form-item label="AList TvBox API Key">
           <el-input v-model="apiKey" style="width: 300px" type="password" readonly show-password/>
           <el-button type="primary" class="hint" @click="resetApiKey">重置</el-button>
+        </el-form-item>
+        <el-form-item label="猫影视Basic Auth">
+          <el-input v-model="basicAuthUser" style="width: 140px" readonly placeholder="用户名"/>
+          <el-input v-model="basicAuthPass" style="width: 220px" type="password" readonly show-password placeholder="密码"/>
+          <el-button type="primary" class="hint" @click="resetBasicAuth">重置</el-button>
         </el-form-item>
         <el-form-item label="夸克TV机器码">
           <el-input v-model="quarkDeviceId" style="width: 300px" type="text"/>
@@ -283,81 +325,13 @@
               @change="updateAListDebug"
             />
           </el-form-item>
-          <el-form-item label="夸克UC分享使用TV帐号">
-            <el-switch
-              v-model="ussQuarkTv"
-              inline-prompt
-              active-text="开启"
-              inactive-text="关闭"
-              @change="updateUssQuarkTv"
-            />
-          </el-form-item>
-        </div>
-        <div class="el-row">
-          <el-form-item label="网盘分享延迟校验">
-            <el-switch
-              v-model="aliLazyLoad"
-              inline-prompt
-              active-text="开启"
-              inactive-text="关闭"
-              @change="updateAliLazyLoad"
-            />
-          </el-form-item>
-          <el-form-item label="自动清理失效资源">
-            <el-switch
-              v-model="cleanInvalidShares"
-              inline-prompt
-              active-text="开启"
-              inactive-text="关闭"
-              @change="updateCleanInvalidShares"
-            />
-          </el-form-item>
-          <el-form-item label="网盘分享校验间隔">
-            <el-input-number v-model="validateSharesInterval" min="1"></el-input-number>
-            &nbsp;&nbsp;小时
-            <span class="hint"></span>
-            <el-button type="primary" @click="updateValidateSharesInterval">更新</el-button>
-          </el-form-item>
-          <el-form-item label="网盘帐号负载均衡">
-            <el-switch
-              v-model="driverRoundRobin"
-              inline-prompt
-              active-text="开启"
-              inactive-text="关闭"
-              @change="updateDriverRoundRobin"
-            />
-          </el-form-item>
-        </div>
-        <div class="el-row">
-          <el-form-item label="开启阿里快传115">
-            <el-switch
-              v-model="aliTo115"
-              inline-prompt
-              active-text="开启"
-              inactive-text="关闭"
-              @change="updateAliTo115"
-            />
-            <span class="hint">帐号页面添加115网盘、配置删除码</span>
-          </el-form-item>
-        </div>
-        <div class="el-row">
-          <el-form-item label="网盘文件删除延时">
-            <el-input-number v-model="deleteDelayTime" min="0"></el-input-number>
-            &nbsp;&nbsp;秒
-            <span class="hint">0表示不删除</span>
-            <span class="hint"></span>
-            <el-button type="primary" @click="updateDeleteDelayTime">更新</el-button>
-          </el-form-item>
-          <el-form-item label="临时分享过期时间">
-            <el-input-number v-model="tempShareExpiration" min="1"></el-input-number>
-            &nbsp;&nbsp;小时
-            <span class="hint"></span>
-            <el-button type="primary" @click="updateTempShareExpiration">更新</el-button>
-          </el-form-item>
         </div>
         <el-form-item>
           <el-button @click="resetAListToken">重置AList认证Token</el-button>
           <el-button @click="exportDatabase">导出数据库</el-button>
+          <el-button @click="exportJsonDatabase">导出 JSON</el-button>
+          <el-button @click="jsonImportVisible = true">导入 JSON</el-button>
+          <el-button @click="openRemoteSync">远程同步配置</el-button>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -366,6 +340,39 @@
       </span>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="jsonImportVisible" title="导入 JSON 备份" width="520px">
+      <el-alert
+        title="覆盖恢复会清空纳入备份的业务数据后再导入，请谨慎操作。建议恢复完成后重启应用。"
+        type="warning"
+        show-icon
+        :closable="false"
+      />
+      <el-form label-width="100px" style="margin-top: 12px">
+        <el-form-item label="恢复模式">
+          <el-radio-group v-model="jsonRestoreMode">
+            <el-radio label="OVERWRITE">覆盖恢复</el-radio>
+            <el-radio label="MERGE">合并恢复</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="备份文件">
+          <el-upload
+            :auto-upload="false"
+            :limit="1"
+            accept=".zip"
+            :on-change="handleJsonFileChange"
+          >
+            <el-button type="primary">选择 ZIP 文件</el-button>
+          </el-upload>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="jsonImportVisible = false">取消</el-button>
+        <el-button type="warning" :loading="jsonImporting" @click="importJsonDatabase">开始恢复</el-button>
+      </template>
+    </el-dialog>
+
+    <RemoteSyncDialog ref="remoteSyncDialogRef" />
 
   </div>
 </template>
@@ -376,6 +383,13 @@ import {ElMessage} from "element-plus";
 import axios from "axios";
 import {onUnmounted} from "@vue/runtime-core";
 import {store} from "@/services/store";
+import RemoteSyncDialog from './RemoteSyncDialog.vue'
+
+const remoteSyncDialogRef = ref()
+
+const openRemoteSync = () => {
+  remoteSyncDialogRef.value.open()
+}
 
 let intervalId = 0
 const currentUrl = window.location.origin
@@ -417,14 +431,13 @@ const mixSiteSource = ref(false)
 const replaceAliToken = ref(false)
 const debugLog = ref(false)
 const aListDebug = ref(false)
-const aliTo115 = ref(false)
-const driverRoundRobin = ref(false)
-const ussQuarkTv = ref(false)
-const aliLazyLoad = ref(false)
-const cleanInvalidShares = ref(false)
 const enableHttps = ref(false)
 const autoCheckin = ref(false)
 const dialogVisible = ref(false)
+const has115Account = ref(false)
+const index115Loading = ref(false)
+const index115Checking = ref(false)
+const index115Check = ref<{hasAccount: boolean, hasUpdate: boolean, localVersion: string, remoteVersion: string, error: string | null}>({hasAccount: false, hasUpdate: false, localVersion: '', remoteVersion: '', error: null})
 const changelog = ref('')
 const aListVersion = ref('')
 const aListRemoteVersion = ref('')
@@ -436,17 +449,23 @@ const indexRemoteVersion = ref('')
 const movieVersion = ref(0)
 const movieRemoteVersion = ref(0)
 const cachedMovieVersion = ref(0)
-const deleteDelayTime = ref(900)
-const tempShareExpiration = ref(72)
-const validateSharesInterval = ref(44)
 const aListStartTime = ref('')
 const openTokenUrl = ref('')
 const dockerAddress = ref('')
 const aliSecret = ref('')
 const tmdbApiKey = ref('')
+const tmdbApiHost = ref('')
+const tmdbApiHostOptions = [
+  {label: '官方 API(直连)', value: ''},
+  {label: 'Worker 轮询池 - round robin', value: 'worker-pool'},
+  {label: 'itv666 代理', value: 'http://tmdb.itv666.cc'},
+  {label: 'NAStool 代理', value: 'https://tmdb.nastool.org'},
+]
 const userAgent = ref('')
 const atvPass = ref('')
 const apiKey = ref('')
+const basicAuthUser = ref('')
+const basicAuthPass = ref('')
 const apiClientId = ref('')
 const apiClientSecret = ref('')
 const quarkDeviceId = ref('')
@@ -459,11 +478,49 @@ const login = ref({
 
 const form = ref({
   token: '',
-  enabledToken: true
+  enabledToken: true,
+  anonymousAccess: false
 })
 
 const formatTime = (value: string | number) => {
   return new Date(value).toLocaleString('zh-cn')
+}
+
+// 比较版本号：支持语义化版本（1.2.3）和日期格式（1234.5678）
+const compareVersion = (v1: string | number, v2: string | number): number => {
+  const ver1 = String(v1).trim()
+  const ver2 = String(v2).trim()
+
+  // 如果任一版本为空，返回相等
+  if (!ver1 || !ver2) return 0
+
+  // 检测是否为语义化版本（包含至少一个点号且非纯数字）
+  const isSemVer1 = ver1.includes('.') && !/^\d+\.\d+$/.test(ver1)
+  const isSemVer2 = ver2.includes('.') && !/^\d+\.\d+$/.test(ver2)
+
+  // 如果都是语义化版本，按段比较
+  if (isSemVer1 && isSemVer2) {
+    const parts1 = ver1.split('.').map(p => parseInt(p) || 0)
+    const parts2 = ver2.split('.').map(p => parseInt(p) || 0)
+    const maxLen = Math.max(parts1.length, parts2.length)
+
+    for (let i = 0; i < maxLen; i++) {
+      const p1 = parts1[i] || 0
+      const p2 = parts2[i] || 0
+      if (p1 > p2) return 1
+      if (p1 < p2) return -1
+    }
+    return 0
+  }
+
+  // 否则转为浮点数比较（兼容旧的日期格式）
+  const num1 = parseFloat(ver1)
+  const num2 = parseFloat(ver2)
+
+  if (isNaN(num1) || isNaN(num2)) return 0
+  if (num1 > num2) return 1
+  if (num1 < num2) return -1
+  return 0
 }
 
 const updateToken = () => {
@@ -495,6 +552,18 @@ const updateOpenTokenUrl = () => {
 
 const updateTmdbApiKey = () => {
   axios.post('/api/settings', {name: 'tmdb_api_key', value: tmdbApiKey.value}).then(() => {
+    ElMessage.success('更新成功')
+  })
+}
+
+const updateTmdbApiHost = () => {
+  const posts: { name: string, value: string }[] = [{name: 'tmdb_api_host', value: tmdbApiHost.value}]
+  // 图床与 API 分线路的预设(NAStool)落 tmdb_image_host,其余(官方/Worker 型,含自定义地址)一律清空走后端跟随 API 池
+  posts.push({
+    name: 'tmdb_image_host',
+    value: tmdbApiHost.value === 'https://tmdb.nastool.org' ? 'https://img.nastool.org' : '',
+  })
+  Promise.all(posts.map(post => axios.post('/api/settings', post))).then(() => {
     ElMessage.success('更新成功')
   })
 }
@@ -532,21 +601,11 @@ const resetAListPassword = () => {
   })
 }
 
-const updateDeleteDelayTime = () => {
-  axios.post('/api/settings', {name: 'delete_delay_time', value: deleteDelayTime.value}).then(() => {
-    ElMessage.success('更新成功')
-  })
-}
-
-const updateTempShareExpiration = () => {
-  axios.post('/api/settings', {name: 'temp_share_expiration', value: tempShareExpiration.value}).then(() => {
-    ElMessage.success('更新成功')
-  })
-}
-
-const updateValidateSharesInterval = () => {
-  axios.post('/api/settings', {name: 'validateSharesInterval', value: validateSharesInterval.value}).then(() => {
-    ElMessage.success('更新成功')
+const resetBasicAuth = () => {
+  axios.post('/api/basic-auth-credentials/regenerate').then(({data}) => {
+    basicAuthUser.value = data.username
+    basicAuthPass.value = data.password
+    ElMessage.success('重置成功')
   })
 }
 
@@ -580,36 +639,6 @@ const updateAListDebug = () => {
   })
 }
 
-const updateAliTo115 = () => {
-  axios.post('/api/settings', {name: 'ali_to_115', value: aliTo115.value}).then(() => {
-    ElMessage.success('更新成功')
-  })
-}
-
-const updateDriverRoundRobin = () => {
-  axios.post('/api/settings', {name: 'driver_round_robin', value: driverRoundRobin.value}).then(() => {
-    ElMessage.success('更新成功')
-  })
-}
-
-const updateUssQuarkTv = () => {
-  axios.post('/api/settings', {name: 'use_quark_tv', value: ussQuarkTv.value}).then(() => {
-    ElMessage.success('更新成功')
-  })
-}
-
-const updateAliLazyLoad = () => {
-  axios.post('/api/settings', {name: 'ali_lazy_load', value: aliLazyLoad.value}).then(() => {
-    ElMessage.success('更新成功，重启生效')
-  })
-}
-
-const updateCleanInvalidShares = () => {
-  axios.post('/api/settings', {name: 'clean_invalid_shares', value: cleanInvalidShares.value}).then(() => {
-    ElMessage.success('更新成功，重启生效')
-  })
-}
-
 const updateQuarkDeviceId = () => {
   axios.post('/api/settings', {name: 'quark_device_id', value: quarkDeviceId.value}).then(() => {
     ElMessage.success('更新成功')
@@ -625,6 +654,45 @@ const updateLogin = () => {
 
 const exportDatabase = () => {
   window.location.href = '/api/settings/export' + '?t=' + new Date().getTime() + '&X-ACCESS-TOKEN=' + localStorage.getItem("token");
+}
+
+const jsonImportVisible = ref(false)
+const jsonImporting = ref(false)
+const jsonRestoreMode = ref<'OVERWRITE' | 'MERGE'>('OVERWRITE')
+const jsonSelectedFile = ref<File | null>(null)
+
+const exportJsonDatabase = () => {
+  window.location.href = '/api/settings/export-json' + '?t=' + new Date().getTime() + '&X-ACCESS-TOKEN=' + localStorage.getItem("token");
+}
+
+const handleJsonFileChange = (uploadFile: any) => {
+  jsonSelectedFile.value = uploadFile?.raw || null
+}
+
+const importJsonDatabase = async () => {
+  if (!jsonSelectedFile.value) {
+    ElMessage.warning('请选择备份文件')
+    return
+  }
+  jsonImporting.value = true
+  const formData = new FormData()
+  formData.append('file', jsonSelectedFile.value)
+  formData.append('mode', jsonRestoreMode.value)
+  try {
+    const {data} = await axios.post('/api/settings/import-json', formData, {
+      headers: {'Content-Type': 'multipart/form-data'}
+    })
+    if (data.success) {
+      ElMessage.success('恢复成功，建议重启应用')
+      jsonImportVisible.value = false
+    } else {
+      ElMessage.error('恢复失败')
+    }
+  } catch (e) {
+    ElMessage.error('恢复失败')
+  } finally {
+    jsonImporting.value = false
+  }
 }
 
 const updateScheduleTime = () => {
@@ -655,15 +723,39 @@ const getAListStatus = () => {
   })
 }
 
+const checkIndex115 = () => {
+  index115Checking.value = true
+  axios.get('/api/index115/check').then(({data}) => {
+    index115Check.value = data
+  }).catch(() => {
+    index115Check.value = {hasAccount: true, hasUpdate: false, localVersion: '', remoteVersion: '', error: '检查失败'}
+  }).finally(() => {
+    index115Checking.value = false
+  })
+}
+
+const updateIndex115 = () => {
+  index115Loading.value = true
+  axios.post('/api/index115/update').then(() => {
+    ElMessage.success('115索引更新完成')
+  }).catch((e) => {
+    ElMessage.error('115索引更新失败：' + (e?.response?.data?.message || e.message))
+  }).finally(() => {
+    index115Loading.value = false
+  })
+}
+
 onMounted(() => {
+  axios.get('/api/basic-auth-credentials').then(({data}) => {
+    basicAuthUser.value = data.username
+    basicAuthPass.value = data.password
+  }).catch(() => {})
   axios.get('/api/settings').then(({data}) => {
     form.value.token = data.token
     form.value.enabledToken = data.enabled_token === 'true'
+    form.value.anonymousAccess = data.anonymous_access === 'true'
     scheduleTime.value = data.schedule_time || new Date(2023, 6, 20, 9, 0)
     aListStartTime.value = data.alist_start_time
-    deleteDelayTime.value = +data.delete_delay_time || 900
-    tempShareExpiration.value = +data.temp_share_expiration || 72
-    validateSharesInterval.value = +data.validateSharesInterval || 4
     movieVersion.value = data.movie_version
     indexVersion.value = data.index_version
     dockerVersion.value = data.docker_version
@@ -673,6 +765,7 @@ onMounted(() => {
     dockerAddress.value = data.docker_address
     aliSecret.value = data.ali_secret
     tmdbApiKey.value = data.tmdb_api_key
+    tmdbApiHost.value = data.tmdb_api_host || ''
     userAgent.value = data.user_agent
     autoCheckin.value = data.auto_checkin === 'true'
     aListRestart.value = data.alist_restart_required === 'true'
@@ -680,11 +773,6 @@ onMounted(() => {
     enableHttps.value = data.enable_https === 'true'
     debugLog.value = data.debug_log === 'true'
     aListDebug.value = data.alist_debug === 'true'
-    aliTo115.value = data.ali_to_115 === 'true'
-    driverRoundRobin.value = data.driver_round_robin === 'true'
-    ussQuarkTv.value = data.use_quark_tv === 'true'
-    cleanInvalidShares.value = data.clean_invalid_shares === 'true'
-    aliLazyLoad.value = data.ali_lazy_load !== 'false'
     mixSiteSource.value = data.mix_site_source !== 'false'
     atvPass.value = data.atv_password
     apiKey.value = data.api_key
@@ -715,6 +803,12 @@ onMounted(() => {
     appRemoteVersion.value = data.app
     aListRemoteVersion.value = data.alist
     changelog.value = data.changelog
+  })
+  axios.get('/api/index115/status').then(({data}) => {
+    has115Account.value = data.hasAccount
+    if (data.hasAccount) {
+      checkIndex115()
+    }
   })
 })
 
@@ -757,6 +851,15 @@ onUnmounted(() => {
 
 .box-card {
   margin-bottom: 12px;
+}
+
+.box-card .el-card__header {
+  border-bottom: none;
+  padding-bottom: 6px;
+}
+
+.box-card .el-card__body {
+  padding-top: 6px;
 }
 
 .changelog {

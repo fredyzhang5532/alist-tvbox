@@ -1,13 +1,16 @@
 <template>
-  <div class="files">
-    <h1>AList访问控制</h1>
-    <el-row justify="end">
-      <el-button @click="load">刷新</el-button>
-      <el-button type="primary" @click="handleAdd">添加</el-button>
-    </el-row>
-    <div class="space"></div>
+  <div class="page-container">
+    <div class="page-header">
+      <h1 class="page-title">AList访问控制</h1>
+      <div class="page-actions">
+        <el-button @click="load">刷新</el-button>
+        <el-button type="primary" @click="handleAdd">添加</el-button>
+      </div>
+    </div>
 
-    <el-table :data="rules" border style="width: 100%">
+    <div class="page-card">
+    <div class="table-scroll-wrapper">
+    <el-table :data="rules" border style="width: 100%; min-width: 800px">
       <el-table-column prop="name" label="名称/Token"/>
       <el-table-column prop="url" label="默认订阅地址" sortable>
         <template #default="scope">
@@ -25,6 +28,7 @@
         </template>
       </el-table-column>
     </el-table>
+    </div>
 
     <div class="divider"></div>
 
@@ -34,10 +38,13 @@
         <li>本功能不需要开启安全订阅</li>
         <li>但是如果开启了安全订阅，名称需要在安全Token列表内才能访问</li>
         <li>网页播放使用第一个安全Token，建议为网页播放设置一个专用的安全Token</li>
+        <li>普通用户对应的安全Token：u-{username}，比如u-user1</li>
         <li>黑名单优先级高于白名单</li>
         <li>本功能对直接访问AList 5344无效</li>
       </ul>
     </div>
+    </div>
+  </div>
 
     <el-dialog v-model="formVisible" :title="dialogTitle">
       <el-form :model="form" label-width="120">
@@ -74,7 +81,6 @@
       </span>
       </template>
     </el-dialog>
-  </div>
 </template>
 
 <script setup lang="ts">

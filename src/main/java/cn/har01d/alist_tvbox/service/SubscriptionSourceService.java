@@ -11,6 +11,7 @@ import cn.har01d.alist_tvbox.entity.SettingRepository;
 import cn.har01d.alist_tvbox.entity.Site;
 import cn.har01d.alist_tvbox.entity.SiteRepository;
 import cn.har01d.alist_tvbox.exception.NotFoundException;
+import cn.har01d.alist_tvbox.model.BuiltinSubscriptionSourceState;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -22,11 +23,15 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Service
 public class SubscriptionSourceService {
     private static final String BUILTIN_SETTINGS_KEY = "builtin_subscription_sources";
     private static final String SORT_ORDER_MIGRATED_KEY = "subscription_source_sort_order_migrated";
+    private static final String WEB_PAGES_FRONT_MIGRATED = "web_pages_front_migrated";
+    private static final Set<String> EXTENDABLE_BUILTINS =
+            Set.of("csp_PianDan", "csp_FishPanSou", "csp_FishPanSouGroup");
 
     private final AppProperties appProperties;
     private final PluginRepository pluginRepository;
@@ -87,36 +92,6 @@ public class SubscriptionSourceService {
     private record ManagedSourceHolder(ManagedSource source, Plugin plugin) {
     }
 
-    private static class BuiltinSourceState {
-        private String name;
-        private Boolean enabled;
-        private Integer sortOrder;
-
-        public String getName() {
-            return name;
-        }
-
-        public void setName(String name) {
-            this.name = name;
-        }
-
-        public Boolean getEnabled() {
-            return enabled;
-        }
-
-        public void setEnabled(Boolean enabled) {
-            this.enabled = enabled;
-        }
-
-        public Integer getSortOrder() {
-            return sortOrder;
-        }
-
-        public void setSortOrder(Integer sortOrder) {
-            this.sortOrder = sortOrder;
-        }
-    }
-
     @PostConstruct
     void migratePluginSortOrders() {
         if (settingRepository.existsByName(SORT_ORDER_MIGRATED_KEY)) {
@@ -160,10 +135,11 @@ public class SubscriptionSourceService {
             if (definition == null) {
                 throw new NotFoundException("内置源不存在");
             }
-            Map<String, BuiltinSourceState> settings = readBuiltinSettings();
-            BuiltinSourceState state = settings.computeIfAbsent(siteKey, ignored -> new BuiltinSourceState());
+            Map<String, BuiltinSubscriptionSourceState> settings = readBuiltinSettings();
+            BuiltinSubscriptionSourceState state = settings.computeIfAbsent(siteKey, ignored -> new BuiltinSubscriptionSourceState());
             state.setName(StringUtils.trimToNull(update.name()));
             state.setEnabled(update.enabled());
+            state.setExtend(StringUtils.trimToNull(update.extend()));
             if (state.getSortOrder() == null || state.getSortOrder() < 1) {
                 state.setSortOrder(definition.defaultSortOrder());
             }
@@ -181,13 +157,13 @@ public class SubscriptionSourceService {
     }
 
     public void reorder(List<String> ids) {
-        Map<String, BuiltinSourceState> settings = readBuiltinSettings();
+        Map<String, BuiltinSubscriptionSourceState> settings = readBuiltinSettings();
         List<Plugin> plugins = new ArrayList<>();
         int order = 1;
         for (String id : ids) {
             if (id.startsWith("builtin-")) {
                 String siteKey = id.substring("builtin-".length());
-                BuiltinSourceState state = settings.computeIfAbsent(siteKey, ignored -> new BuiltinSourceState());
+                BuiltinSubscriptionSourceState state = settings.computeIfAbsent(siteKey, ignored -> new BuiltinSubscriptionSourceState());
                 state.setSortOrder(order++);
                 if (state.getEnabled() == null) {
                     state.setEnabled(true);
@@ -204,6 +180,70 @@ public class SubscriptionSourceService {
         saveBuiltinSettings(settings);
     }
 
+    /**
+     * 把插件行挪到插件区最前(第一个非内置源之前,全内置则追加尾部即内置之后):
+     * 新上传的自定义网页源不沉底;其余源保持相对顺序,订阅源管理中仍可任意调序。
+     */
+    /**
+     * 存量自定义网页源一次性前置:首版上传的网页源落在插件区之后(moveToFrontOfPlugins
+     * 仅对新建行生效,重扫保留既有位置),启动时一次性把它们挪到插件区最前;
+     * 迁移标志防重复,之后用户在订阅源管理里的手动调序不再被动。
+     */
+    public synchronized void migrateWebPagesToFrontOnce() {
+        if (settingRepository.existsByName(WEB_PAGES_FRONT_MIGRATED)) {
+            return;
+        }
+        List<ManagedSource> all = findAll();
+        List<String> webPageIds = new ArrayList<>();
+        for (ManagedSource source : all) {
+            if (!source.builtin() && source.url() != null
+                    && source.url().startsWith(PluginService.WEB_PAGE_URL_PREFIX)) {
+                webPageIds.add(source.id());
+            }
+        }
+        if (!webPageIds.isEmpty()) {
+            List<String> ordered = new ArrayList<>();
+            boolean inserted = false;
+            for (ManagedSource source : all) {
+                if (webPageIds.contains(source.id())) {
+                    continue;
+                }
+                if (!inserted && !source.builtin()) {
+                    ordered.addAll(webPageIds);
+                    inserted = true;
+                }
+                ordered.add(source.id());
+            }
+            if (!inserted) {
+                ordered.addAll(webPageIds);
+            }
+            reorder(ordered);
+        }
+        settingRepository.save(new Setting(WEB_PAGES_FRONT_MIGRATED, "true"));
+    }
+
+    public synchronized void moveToFrontOfPlugins(String pluginRowId) {
+        List<ManagedSource> all = findAll();
+        if (all.stream().noneMatch(source -> pluginRowId.equals(source.id()))) {
+            return;
+        }
+        List<String> ordered = new ArrayList<>();
+        boolean inserted = false;
+        for (ManagedSource source : all) {
+            if (!inserted && !source.builtin() && !pluginRowId.equals(source.id())) {
+                ordered.add(pluginRowId);
+                inserted = true;
+            }
+            if (!pluginRowId.equals(source.id())) {
+                ordered.add(source.id());
+            }
+        }
+        if (!inserted) {
+            ordered.add(pluginRowId);
+        }
+        reorder(ordered);
+    }
+
     public void normalizeSortOrders() {
         reorder(findAll().stream().map(ManagedSource::id).toList());
     }
@@ -216,7 +256,7 @@ public class SubscriptionSourceService {
     }
 
     private List<ManagedSourceHolder> buildManagedSources() {
-        Map<String, BuiltinSourceState> settings = readBuiltinSettings();
+        Map<String, BuiltinSubscriptionSourceState> settings = readBuiltinSettings();
         List<ManagedSourceHolder> sources = new ArrayList<>();
         for (BuiltinDefinition definition : builtinDefinitions()) {
             sources.add(buildBuiltinSource(definition, settings.get(definition.siteKey())));
@@ -229,7 +269,7 @@ public class SubscriptionSourceService {
         return sources;
     }
 
-    private ManagedSourceHolder buildBuiltinSource(BuiltinDefinition definition, BuiltinSourceState state) {
+    private ManagedSourceHolder buildBuiltinSource(BuiltinDefinition definition, BuiltinSubscriptionSourceState state) {
         ManagedSource source = new ManagedSource(
                 "builtin-" + definition.siteKey(),
                 true,
@@ -241,17 +281,27 @@ public class SubscriptionSourceService {
                 state == null || state.getEnabled() == null || state.getEnabled(),
                 state == null || state.getSortOrder() == null || state.getSortOrder() < 1 ? definition.defaultSortOrder() : state.getSortOrder(),
                 null,
-                "",
+                StringUtils.defaultString(state == null ? null : state.getExtend()),
                 "",
                 "",
                 false,
                 false,
-                false
+                EXTENDABLE_BUILTINS.contains(definition.siteKey())
         );
         return new ManagedSourceHolder(source, null);
     }
 
+    public String getBuiltinExtend(String siteKey) {
+        if (!EXTENDABLE_BUILTINS.contains(siteKey)) {
+            return null;
+        }
+        BuiltinSubscriptionSourceState state = readBuiltinSettings().get(siteKey);
+        return state == null ? null : state.getExtend();
+    }
+
     private ManagedSourceHolder buildPluginSource(Plugin plugin) {
+        // 自定义网页源:文件即内容,「刷新」按 spider 插件逻辑下载解析无意义,隐藏
+        boolean webPage = PluginService.isWebPagePlugin(plugin);
         ManagedSource source = new ManagedSource(
                 "plugin-" + plugin.getId(),
                 false,
@@ -267,8 +317,8 @@ public class SubscriptionSourceService {
                 plugin.getLastCheckedAt() == null ? "" : plugin.getLastCheckedAt().toString(),
                 StringUtils.defaultString(plugin.getLastError()),
                 true,
-                true,
-                true
+                !webPage,
+                !webPage
         );
         return new ManagedSourceHolder(source, plugin);
     }
@@ -284,11 +334,16 @@ public class SubscriptionSourceService {
     private List<BuiltinDefinition> builtinDefinitions() {
         List<BuiltinDefinition> definitions = new ArrayList<>();
         int order = 1;
+        // WebHome 网页首页站(非 spider 站点,SubscriptionService.addSite 特判构建):
+        // 与其它内置源同权管理 —— 列表可见、可禁用、可调序;是否随订阅下发仍按客户端能力门禁
+        definitions.add(new BuiltinDefinition("atv_home", "影视首页", order++));
+        definitions.add(new BuiltinDefinition("csp_PianDan", "片单导航", order++));
         Site xiaoya = siteRepository.findById(1).orElse(null);
         if (xiaoya != null) {
             definitions.add(new BuiltinDefinition("csp_XiaoYa", xiaoya.getName(), order++));
         }
         definitions.add(new BuiltinDefinition("csp_AList", "AList", order++));
+        definitions.add(new BuiltinDefinition("csp_Media", "我的追剧", order++));
         definitions.add(new BuiltinDefinition("csp_BiliBili", "BiliBili", order++));
         if (embyRepository.count() > 0) {
             definitions.add(new BuiltinDefinition("csp_Emby", "Emby", order++));
@@ -301,14 +356,15 @@ public class SubscriptionSourceService {
         }
         definitions.add(new BuiltinDefinition("csp_Live", "网络直播", order++));
         definitions.add(new BuiltinDefinition("csp_TgDouBan", "电报豆瓣", order++));
-        if (appProperties.isTgLogin() || StringUtils.isNotBlank(appProperties.getTgSearch())) {
-            definitions.add(new BuiltinDefinition("csp_TgSearch", "电报搜索", order++));
+        if (StringUtils.isNotBlank(appProperties.getTgSearch())) {
+            definitions.add(new BuiltinDefinition("csp_TgChannel", "电报频道", order++));
         }
         definitions.add(new BuiltinDefinition("csp_TgWeb", "电报网页", order++));
         if (StringUtils.isNotBlank(appProperties.getPanSouUrl())) {
             definitions.add(new BuiltinDefinition("csp_FishPanSou", "鱼佬盘搜", order));
+            definitions.add(new BuiltinDefinition("csp_FishPanSouGroup", "盘搜 • 分组", order++));
         }
-        definitions.add(new BuiltinDefinition("csp_Push", "推送", order++));
+        definitions.add(new BuiltinDefinition("csp_Push", "AT推送", order++));
         return definitions;
     }
 
@@ -316,7 +372,7 @@ public class SubscriptionSourceService {
         return Integer.parseInt(id.substring("plugin-".length()));
     }
 
-    private Map<String, BuiltinSourceState> readBuiltinSettings() {
+    private Map<String, BuiltinSubscriptionSourceState> readBuiltinSettings() {
         return settingRepository.findById(BUILTIN_SETTINGS_KEY)
                 .map(Setting::getValue)
                 .filter(StringUtils::isNotBlank)
@@ -324,7 +380,7 @@ public class SubscriptionSourceService {
                 .orElseGet(HashMap::new);
     }
 
-    private Map<String, BuiltinSourceState> parseBuiltinSettings(String value) {
+    private Map<String, BuiltinSubscriptionSourceState> parseBuiltinSettings(String value) {
         try {
             return objectMapper.readValue(value, new TypeReference<>() {
             });
@@ -333,7 +389,7 @@ public class SubscriptionSourceService {
         }
     }
 
-    private void saveBuiltinSettings(Map<String, BuiltinSourceState> settings) {
+    private void saveBuiltinSettings(Map<String, BuiltinSubscriptionSourceState> settings) {
         try {
             settingRepository.save(new Setting(BUILTIN_SETTINGS_KEY, objectMapper.writeValueAsString(settings)));
         } catch (Exception e) {

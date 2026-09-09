@@ -30,7 +30,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -122,6 +122,10 @@ public class AListService {
     }
 
     public FsResponse listFiles(Site site, String path, int page, int size) {
+        return listFiles(site, path, page, size, false);
+    }
+
+    public FsResponse listFiles(Site site, String path, int page, int size, boolean refresh) {
         int version = getVersion(site);
         String url = getUrl(site) + (version == 2 ? "/api/public/path" : "/api/fs/list");
         FsRequest request = new FsRequest();
@@ -132,6 +136,7 @@ public class AListService {
         }
         request.setPage(page);
         request.setSize(size);
+        request.setRefresh(refresh);
         log.debug("call api: {} request: {}", url, request);
         FsListResponse response = post(site, url, request, FsListResponse.class);
         logError(response);
@@ -143,21 +148,35 @@ public class AListService {
         if (response == null) {
             return null;
         }
+
+        // Check for null files list to prevent NPE
+        List<FsInfo> files = response.getFiles();
+        if (files == null) {
+            log.warn("Response has null files list");
+            return response;
+        }
+
         if (version == 2) {
-            for (FsInfo fsInfo : response.getFiles()) {
+            for (FsInfo fsInfo : files) {
                 fsInfo.setThumb(fsInfo.getThumbnail());
             }
-        } else if (response != null && response.getContent() != null) {
+        } else if (response.getContent() != null) {
             response.setFiles(response.getContent());
+            files = response.getFiles();
         }
-        response.setFiles(filter(response.getFiles()));
-        for (var file : response.getFiles()) {
-            try {
-                file.setModified(OffsetDateTime.parse(file.getModified()).toLocalDateTime().truncatedTo(ChronoUnit.SECONDS).toString());
-            } catch (Exception e) {
-                log.debug("{}", e.getMessage());
+
+        // Filter files if list is not null
+        if (files != null) {
+            response.setFiles(filter(files));
+            for (var file : response.getFiles()) {
+                try {
+                    file.setModified(OffsetDateTime.parse(file.getModified()).toLocalDateTime().truncatedTo(ChronoUnit.SECONDS).toString());
+                } catch (Exception e) {
+                    log.debug("{}", e.getMessage());
+                }
             }
         }
+
         return response;
     }
 
@@ -257,6 +276,83 @@ public class AListService {
         logError(response);
     }
 
+    /** 创建目录(已存在时 AList 返回 500,调用方自行容忍)。 */
+    public void mkdir(Site site, String path) {
+        Map<String, Object> data = new HashMap<>();
+        data.put("path", path);
+        String url = getUrl(site) + "/api/fs/mkdir";
+        log.debug("call api: {} request: {}", url, data);
+        LoginResponse response = postAdmin(site, url, data, LoginResponse.class);
+        logError(response);
+    }
+
+    /** 提交跨存储复制任务(异步,AList copy task);成功返回 true。 */
+    public boolean copy(Site site, String srcDir, String dstDir, List<String> names) {
+        Map<String, Object> data = new HashMap<>();
+        data.put("src_dir", srcDir);
+        data.put("dst_dir", dstDir);
+        data.put("names", names);
+        data.put("overwrite", false);
+        String url = getUrl(site) + "/api/fs/copy";
+        log.info("submit copy task: {} -> {} ({} files)", srcDir, dstDir, names.size());
+        LoginResponse response = postAdmin(site, url, data, LoginResponse.class);
+        logError(response);
+        return true;
+    }
+
+    /**
+     * 分享服务端转存(同步,网盘侧秒传,不经服务器字节中转):把 srcDir 下的文件/目录转存到 dstDir。
+     * 源挂载驱动需实现服务端转存契约(全部分享盘族→同族账号;115 仅 cookie 版账号),
+     * 不支持时端点返回错误,由调用方回退 copy 字节中转。
+     */
+    public void shareSave(Site site, String srcDir, List<String> names, String dstDir) {
+        Map<String, Object> data = new HashMap<>();
+        data.put("src_dir", srcDir);
+        data.put("names", names);
+        data.put("dst_dir", dstDir);
+        String url = getUrl(site) + "/api/fs/share/save";
+        log.info("share save: {}/{} -> {} ({} objects)", srcDir, names, dstDir, names.size());
+        LoginResponse response = postAdmin(site, url, data, LoginResponse.class);
+        logError(response);
+    }
+
+    /**
+     * 轮询 AList copy 任务直至全部完成或超时。
+     *
+     * @return true = 无未完成任务(视为完成;失败靠调用方事后校验目标文件发现)
+     */
+    public boolean awaitCopyTasks(Site site, long timeoutMillis) {
+        String url = getUrl(site) + "/api/admin/task/copy/undone";
+        String token = login(site); // 轮询期间复用同一 token,避免每 3s 登录一次
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                HttpHeaders headers = new HttpHeaders();
+                headers.set(HttpHeaders.AUTHORIZATION, token);
+                ResponseEntity<com.fasterxml.jackson.databind.JsonNode> response =
+                        restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(null, headers),
+                                com.fasterxml.jackson.databind.JsonNode.class);
+                // 任务列表接口返回裸数组 data;分页接口才是 data.content 包裹,两种都要兼容,
+                // 否则解析落空会把"任务还没注册进列表"误判成"全部完成"
+                var data = response.getBody() == null ? null : response.getBody().path("data");
+                var content = data != null && data.isArray() ? data
+                        : (data == null ? null : data.path("content"));
+                if (content == null || !content.isArray() || content.isEmpty()) {
+                    return true;
+                }
+                log.info("copy tasks running: {}", content.size());
+                Thread.sleep(3000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (Exception e) {
+                log.warn("poll copy tasks failed: {}", e.getMessage());
+                return false;
+            }
+        }
+        return false;
+    }
+
     public FsDetail getFile(Site site, String path) {
         int version = getVersion(site);
         if (version == 2) {
@@ -313,8 +409,8 @@ public class AListService {
     }
 
     private Integer getVersion(Site site) {
-        if (site.getVersion() != null) {
-            return site.getVersion();
+        if (site.getStorageVersion() != null) {
+            return site.getStorageVersion();
         }
 
         String url = getUrl(site) + "/api/public/settings";
@@ -327,7 +423,7 @@ public class AListService {
             version = 2;
         }
         log.info("site {}:{} version: {}", site.getId(), site.getName(), version);
-        site.setVersion(version);
+        site.setStorageVersion(version);
         siteService.save(site);
 
         return version;

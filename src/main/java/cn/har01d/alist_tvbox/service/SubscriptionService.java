@@ -3,13 +3,17 @@ package cn.har01d.alist_tvbox.service;
 import cn.har01d.alist_tvbox.config.AppProperties;
 import cn.har01d.alist_tvbox.domain.DriverType;
 import cn.har01d.alist_tvbox.domain.Role;
+import cn.har01d.alist_tvbox.dto.SourceKeyUsageCount;
 import cn.har01d.alist_tvbox.dto.TokenDto;
 import cn.har01d.alist_tvbox.entity.Account;
 import cn.har01d.alist_tvbox.entity.AccountRepository;
 import cn.har01d.alist_tvbox.entity.DriverAccount;
+import cn.har01d.alist_tvbox.entity.PlaybackToken;
+import cn.har01d.alist_tvbox.entity.PlaybackTokenRepository;
 import cn.har01d.alist_tvbox.entity.DriverAccountRepository;
 import cn.har01d.alist_tvbox.entity.EmbyRepository;
 import cn.har01d.alist_tvbox.entity.FeiniuRepository;
+import cn.har01d.alist_tvbox.entity.HistoryRepository;
 import cn.har01d.alist_tvbox.entity.JellyfinRepository;
 import cn.har01d.alist_tvbox.entity.Plugin;
 import cn.har01d.alist_tvbox.entity.PluginFilter;
@@ -24,9 +28,11 @@ import cn.har01d.alist_tvbox.entity.Subscription;
 import cn.har01d.alist_tvbox.entity.SubscriptionRepository;
 import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.exception.NotFoundException;
+import cn.har01d.alist_tvbox.util.ConfigPayloadExtractor;
 import cn.har01d.alist_tvbox.util.Constants;
 import cn.har01d.alist_tvbox.util.IdUtils;
 import cn.har01d.alist_tvbox.util.Utils;
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -36,7 +42,7 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -64,6 +70,8 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -76,8 +84,10 @@ import java.util.stream.Collectors;
 
 import static cn.har01d.alist_tvbox.util.Constants.ALI_SECRET;
 import static cn.har01d.alist_tvbox.util.Constants.BILIBILI_COOKIE;
+import static cn.har01d.alist_tvbox.util.Constants.ANONYMOUS_ACCESS;
 import static cn.har01d.alist_tvbox.util.Constants.ENABLED_TOKEN;
 import static cn.har01d.alist_tvbox.util.Constants.TOKEN;
+import static cn.har01d.alist_tvbox.util.Constants.USER_TOKEN_PREFIX;
 
 @Slf4j
 @Service
@@ -85,6 +95,13 @@ import static cn.har01d.alist_tvbox.util.Constants.TOKEN;
 public class SubscriptionService {
     private static final String PLUGIN_RUN_MODE = "plugin_run_mode";
     private static final String PLUGIN_RUN_MODE_PYTHON = "python";
+    private static final String ATVP_RUNTIME_REVISION = "preheat-v1";
+    private static final String AUTO_UPDATE_PG = "auto_update_pg";
+    private static final String AUTO_UPDATE_ZX = "auto_update_zx";
+    private static final String AUTO_UPDATE_XS = "auto_update_xs";
+    private static final String SYSTEM_PLAYBACK_TOKEN_NAME = "系统订阅同步";
+    /** WebHome 网页首页站点 key(内置源之一,订阅源管理可禁用/调序/改名)。 */
+    private static final String WEB_HOME_KEY = "atv_home";
 
     private final Environment environment;
     private final AppProperties appProperties;
@@ -108,11 +125,18 @@ public class SubscriptionService {
     private final UserService userService;
     private final FileDownloader fileDownloader;
     private final SubscriptionSourceService subscriptionSourceService;
+    private final PlaybackTokenRepository playbackTokenRepository;
+    private final WebHomeService webHomeService;
+    private final HistoryRepository historyRepository;
 
     private final OkHttpClient okHttpClient = new OkHttpClient();
     private final ThreadLocal<String> currentToken = new ThreadLocal<>();
+    // 本请求的用户 token 已通过密钥验真(u-{username}-{secret} 形态,checkToken 归一化后记录裸形态)
+    private final ThreadLocal<String> verifiedUserToken = new ThreadLocal<>();
 
     private String tokens = "";
+    // 亲友共享模式:安全订阅开启时仍放行无 token 请求,并为其注入首个安全 token(老订阅地址零改动)
+    private boolean anonymousAccess;
 
     public SubscriptionService(Environment environment,
                                AppProperties appProperties,
@@ -135,7 +159,10 @@ public class SubscriptionService {
                                TenantService tenantService,
                                UserService userService,
                                FileDownloader fileDownloader,
-                               SubscriptionSourceService subscriptionSourceService) {
+                               SubscriptionSourceService subscriptionSourceService,
+                               PlaybackTokenRepository playbackTokenRepository,
+                               WebHomeService webHomeService,
+                               HistoryRepository historyRepository) {
         this.environment = environment;
         this.appProperties = appProperties;
         this.restTemplate = builder
@@ -161,6 +188,9 @@ public class SubscriptionService {
         this.userService = userService;
         this.fileDownloader = fileDownloader;
         this.subscriptionSourceService = subscriptionSourceService;
+        this.playbackTokenRepository = playbackTokenRepository;
+        this.webHomeService = webHomeService;
+        this.historyRepository = historyRepository;
     }
 
     @PostConstruct
@@ -174,10 +204,18 @@ public class SubscriptionService {
                     .map(Setting::getValue)
                     .orElse("");
         }
+        // 兜底:TOKEN 缺失或显式空串都生成,保证启动后 tokens 永远非空
+        if (StringUtils.isBlank(tokens)) {
+            tokens = Utils.generateUsername();
+            settingRepository.save(new Setting(TOKEN, tokens));
+        }
 
         if (!settingRepository.existsByName(ENABLED_TOKEN)) {
             settingRepository.save(new Setting(ENABLED_TOKEN, String.valueOf(!tokens.isEmpty())));
         }
+        anonymousAccess = Boolean.parseBoolean(settingRepository.findById(ANONYMOUS_ACCESS)
+                .map(Setting::getValue)
+                .orElse("false"));
 
         if (list.isEmpty()) {
             Subscription sub = new Subscription();
@@ -214,10 +252,17 @@ public class SubscriptionService {
             sub.setName("真心");
             sub.setUrl("/zx/FongMi.json");
             subscriptionRepository.save(sub);
+
+            sub = new Subscription();
+            sub.setSid("xs");
+            sub.setName("潇洒");
+            sub.setUrl("/static/xs/TVBoxOSC/tvbox/api.json");
+            subscriptionRepository.save(sub);
         } else {
             fixUrl(list);
             fixSid(list);
             fixId(list);
+            fixXsSubscription(list);
         }
         List<Subscription> duplicated = new ArrayList<>();
         Map<String, Subscription> map = new HashMap<>();
@@ -284,29 +329,159 @@ public class SubscriptionService {
         }
     }
 
+    private void fixXsSubscription(List<Subscription> list) {
+        if (!settingRepository.existsByName("fix_sub_xs")) {
+            boolean hasXs = list.stream().anyMatch(s -> "xs".equals(s.getSid()));
+            if (!hasXs) {
+                Subscription sub = new Subscription();
+                sub.setSid("xs");
+                sub.setName("潇洒");
+                sub.setUrl("/static/xs/TVBoxOSC/tvbox/api.json");
+                subscriptionRepository.save(sub);
+                list.add(sub);
+            }
+            settingRepository.save(new Setting("fix_sub_xs", "true"));
+        }
+    }
+
     public void checkToken(String rawToken) {
+        // u-{username}-{vodSecret} 凭证形态:验真通过则归一化为裸 u-{username}(内容/租户口径不变),
+        // 并打上验真标记 —— 凭证注入(tokenm/open/play 直链)只认该标记,裸 u- 无熵不得作为凭证权威
+        var credentialUser = userService.findUserByCredentialToken(rawToken);
+        if (credentialUser != null) {
+            rawToken = UserService.userVodToken(credentialUser.getUsername());
+            verifiedUserToken.set(rawToken);
+        } else {
+            verifiedUserToken.remove();
+        }
         currentToken.set(rawToken);
         tenantService.setTenant(rawToken);
         if (!appProperties.isEnabledToken()) {
             return;
         }
 
-        if (userService.isUsernameExist(rawToken)) {
+        // 亲友共享模式:无 token 请求放行(仍以匿名身份下发配置,个人订阅/凭证端点照旧校验)
+        if (anonymousAccess && rawToken.isBlank()) {
             return;
         }
 
+        // 全局 tokens 优先匹配:与用户名撞车时按共享 token 处理,避免被用户名分支抢走
         for (String t : tokens.split(",")) {
             if (t.equals(rawToken)) {
                 return;
             }
         }
 
+        // USER 角色的 vod token 为 u-{username}(/api/token 对非 ADMIN 返回该值),内容接口需放行。
+        // 裸用户名不再是合法 token;全局 tokens 保存时已过滤 u- 前缀,两个空间不撞车。
+        if (userService.usernameOfUserVodToken(rawToken) != null
+                && userService.isUsernameExist(userService.usernameOfUserVodToken(rawToken))) {
+            return;
+        }
+
         throw new BadRequestException();
+    }
+
+    /**
+     * 校验订阅 token 是否合法(命中已配置的 token 列表)。不依赖 enabledToken,不做"用户名当 token"旁路。
+     */
+    public boolean isValidSubscriptionToken(String rawToken) {
+        if (StringUtils.isBlank(rawToken) || tokens == null || tokens.isBlank()) {
+            return false;
+        }
+        for (String t : tokens.split(",")) {
+            if (!t.isBlank() && t.equals(rawToken)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 凭证类端点(如 /pg/lib/tokenm)专用:始终要求合法订阅 token,不受全局 enabledToken 影响。
+     * 兼容性:loadLocalConfigJson 生成的配置已注入 getFirstSubscriptionToken(),合法消费端自带有效 token。
+     */
+    public void requireSubscriptionToken(String rawToken) {
+        currentToken.set(rawToken);
+        tenantService.setTenant(rawToken);
+        if (!isValidSubscriptionToken(rawToken)) {
+            throw new BadRequestException();
+        }
+    }
+
+    /** 返回首个真实订阅 token(不受 enabledToken/"-" 占位影响);无配置则返回空串。 */
+    public String getFirstSubscriptionToken() {
+        return tokens.split(",")[0];
+    }
+
+    /** vod token → 凭证视角 uid:u-{username}-{secret} 验真 → 该用户;共享 token → 0;其它(含裸 u-)→ -1。 */
+    public int credentialAuthorityUidFor(String token) {
+        var user = userService.findUserByCredentialToken(token);
+        if (user != null) {
+            return user.getId() == null ? -1 : user.getId();
+        }
+        return isValidSubscriptionToken(token) ? 0 : -1;
+    }
+
+    /**
+     * vod token → 凭证视角 uid:u-{username} → 该用户 id;共享 token → 0(管理级);其它/空 → -1(无 token 上下文)。
+     * 播放直连/凭证下发的归属判定统一入口。
+     */
+    public int credentialUidFor(String token) {
+        var user = userService.findByUserVodToken(token);
+        if (user != null) {
+            return user.getId() == null ? -1 : user.getId();
+        }
+        if (isValidSubscriptionToken(token)) {
+            return 0;
+        }
+        return -1;
+    }
+
+    /**
+     * 带"验真"要求的凭证 uid(tokenm/play 直连等无会话凭证下发用):
+     * 裸 u-{username} 无熵(用户名可猜测)不得作为凭证权威,返回 -1;
+     * 共享 token/全局上下文不受影响;u- 形态须由 checkToken 验真(带密钥)后才认。
+     */
+    public int verifiedCredentialUidFor(String token) {
+        if (token != null && token.startsWith(USER_TOKEN_PREFIX)) {
+            return token.equals(verifiedUserToken.get()) ? credentialUidFor(token) : -1;
+        }
+        return credentialUidFor(token);
+    }
+
+    /** 配置生成时的凭证账号:u- token 须验真(带密钥)才注入本人账号;裸 u- 不给本人凭证、也不回落全局 master。 */
+    private Optional<Account> credentialAliAccount() {
+        int uid = verifiedCredentialUidFor(getCurrentToken());
+        if (uid > 0) {
+            return accountRepository.findFirstByOwnerUidOrderByIdAsc(uid);
+        }
+        if (uid == 0) {
+            return accountRepository.getFirstByMasterTrue();
+        }
+        return getCurrentToken().startsWith(USER_TOKEN_PREFIX) ? Optional.empty() : accountRepository.getFirstByMasterTrue();
+    }
+
+    private Optional<DriverAccount> credentialQuarkAccount() {
+        int uid = verifiedCredentialUidFor(getCurrentToken());
+        if (uid > 0) {
+            return panAccountRepository.findFirstByOwnerUidAndTypeOrderByIdAsc(uid, DriverType.QUARK);
+        }
+        if (uid == 0) {
+            return panAccountRepository.findByTypeAndMasterTrue(DriverType.QUARK);
+        }
+        return getCurrentToken().startsWith(USER_TOKEN_PREFIX) ? Optional.empty() : panAccountRepository.findByTypeAndMasterTrue(DriverType.QUARK);
+    }
+
+    /** token 模式是否开启(运行时可经 /api/token 切换):TokenFilter 据此收紧无 token 的 /open。 */
+    public boolean isTokenEnabled() {
+        return appProperties.isEnabledToken();
     }
 
     public TokenDto getTokens() {
         TokenDto tokenDto = new TokenDto();
         tokenDto.setEnabledToken(appProperties.isEnabledToken());
+        tokenDto.setAnonymousAccess(anonymousAccess);
 
         String role = Optional.of(SecurityContextHolder.getContext())
                 .map(SecurityContext::getAuthentication)
@@ -314,7 +489,9 @@ public class SubscriptionService {
                 .map(e -> e.iterator().next().getAuthority())
                 .orElse(Role.USER.name());
         tokenDto.setRole(role);
-        if (role.equals(Role.ADMIN.name())) {
+        // ADMIN 与服务端互访的 CLIENT(X-API-KEY)都返回共享 token;CLIENT principal 是 "client" 而非用户名,
+        // u-client 不是合法 vod token,按用户名分支拼会把 API-key 客户端的 VOD 地址弄成永远 400
+        if (role.equals(Role.ADMIN.name()) || role.equals(Role.CLIENT.name())) {
             tokenDto.setToken(tokens);
         } else {
             String username = Optional.of(SecurityContextHolder.getContext())
@@ -322,7 +499,7 @@ public class SubscriptionService {
                     .map(Authentication::getPrincipal)
                     .map(Object::toString)
                     .orElse("");
-            tokenDto.setToken(username);
+            tokenDto.setToken(UserService.userVodToken(username));
         }
 
         return tokenDto;
@@ -350,20 +527,32 @@ public class SubscriptionService {
 
     public void clearRequestContext() {
         currentToken.remove();
+        verifiedUserToken.remove();
         tenantService.clear();
     }
 
     public TokenDto updateToken(TokenDto dto) {
         if (dto.isEnabledToken() && StringUtils.isBlank(dto.getToken())) {
-            tokens = IdUtils.generate(8);
+            tokens = Utils.generateUsername();
         } else {
-            tokens = Arrays.stream(dto.getToken().split(",")).filter(StringUtils::isNotBlank).collect(Collectors.joining(","));
+            // u- 前缀保留给用户级 token(u-{username}),全局 tokens 一律过滤,防止两个空间撞车
+        tokens = Arrays.stream(dto.getToken().split(","))
+                .filter(StringUtils::isNotBlank)
+                .filter(t -> !t.startsWith(USER_TOKEN_PREFIX))
+                .collect(Collectors.joining(","));
+        }
+        // 兜底:任何路径都不得把 tokens 置空(否则 /pg/lib/tokenm 无有效 token 可校验)
+        if (tokens.isBlank()) {
+            tokens = Utils.generateUsername();
         }
         dto.setToken(tokens);
         aListLocalService.updateSetting("sign_all", String.valueOf(dto.isEnabledToken()), "bool");
         settingRepository.save(new Setting(ENABLED_TOKEN, String.valueOf(dto.isEnabledToken())));
         settingRepository.save(new Setting(TOKEN, tokens));
         appProperties.setEnabledToken(dto.isEnabledToken());
+        anonymousAccess = dto.isAnonymousAccess();
+        settingRepository.save(new Setting(ANONYMOUS_ACCESS, String.valueOf(anonymousAccess)));
+        dto.setAnonymousAccess(anonymousAccess);
         return dto;
     }
 
@@ -377,26 +566,18 @@ public class SubscriptionService {
 
     public String node(String file) throws IOException {
         log.debug("load file {}", file);
+        // 深路径端点(/node/{token}/**)开放了子目录分发,统一拒绝穿越路径
+        if (!CatPackageService.isSafePath(file)) {
+            throw new NotFoundException("非法路径");
+        }
+        // bundle 装载器的心跳信标(?stage=xxx):落到文件会 404 并打 ERROR 栈,特判为合法端点
+        if ("custom/heartbeat".equals(file)) {
+            return "ok";
+        }
         if (file.contains("index.config.js")) {
             Path config = Utils.getWebPath("cat", "index.config.js");
             String json = Files.readString(config);
-            String secret = appProperties.isEnabledToken() ? ("/" + tokens.split(",")[0]) : "";
-            json = json.replace("VOD_URL", readHostAddress("/vod" + secret));
-            json = json.replace("VOD1_URL", readHostAddress("/vod1" + secret));
-            json = json.replace("BILIBILI_URL", readHostAddress("/bilibili" + secret));
-            json = json.replace("YOUTUBE_URL", readHostAddress("/youtube" + secret));
-            json = json.replace("EMBY_URL", readHostAddress("/emby" + secret));
-            String ali = accountRepository.getFirstByMasterTrue().map(Account::getRefreshToken).orElse("");
-            json = json.replace("ALI_TOKEN", ali);
-            ali = accountRepository.getFirstByMasterTrue().map(Account::getOpenToken).orElse("");
-            json = json.replace("ALI_OPEN_TOKEN", ali);
-
-            String quarkCookie = panAccountRepository.findByTypeAndMasterTrue(DriverType.QUARK).map(DriverAccount::getCookie).orElse("");
-            json = json.replace("QUARK_COOKIE", quarkCookie);
-
-            String address = readHostAddress();
-            json = json.replace("DOCKER_ADDRESS", address);
-            json = json.replace("ATV_ADDRESS", address);
+            json = replaceLegacyConfig(json);
 
             if ("index.config.js".equals(file)) {
                 return json;
@@ -404,14 +585,96 @@ public class SubscriptionService {
                 return Utils.md5(json);
             }
         }
+        if ("index.js".equals(file) || "index.js.md5".equals(file)) {
+            // 部分宿主(原版猫影视等)拉三件套但不把 index.config.js 传给 start(),
+            // bundle 内嵌默认配置里的 ATV_* 占位符必须由服务端注入真实地址,
+            // 否则自定义爬虫加载器拿不到后端地址(装载静默失败)。md5 同步动态计算。
+            var cached = indexJsCache.get();
+            long mtime = Files.getLastModifiedTime(Utils.getWebPath("cat", "index.js")).toMillis();
+            String host = readHostAddress();
+            if (cached == null || cached.mtime != mtime || !cached.host.equals(host)) {
+                String replaced = replaceLegacyConfig(Files.readString(Utils.getWebPath("cat", "index.js")));
+                cached = new IndexJsCache(mtime, host, replaced, Utils.md5(replaced));
+                indexJsCache.set(cached);
+            }
+            return "index.js".equals(file) ? cached.content : cached.md5;
+        }
         return Files.readString(Utils.getWebPath("cat", file));
     }
 
+    private record IndexJsCache(long mtime, String host, String content, String md5) {
+    }
+
+    private final java.util.concurrent.atomic.AtomicReference<IndexJsCache> indexJsCache = new java.util.concurrent.atomic.AtomicReference<>();
+
+    private String replaceLegacyConfig(String json) {
+        String secret = appProperties.isEnabledToken() ? ("/" + getCurrentOrFirstToken()) : "";
+        // ATV_* 占位符必须先于 EMBY_URL 等短占位符替换,否则 ATV_EMBY_URL 会被腰斩成 ATV_http://...
+        Map<String, String> atvPaths = new LinkedHashMap<>();
+        atvPaths.put("ATV_MEDIA_URL", "/media");
+        atvPaths.put("ATV_MEDIA_PLAY_URL", "/play");
+        atvPaths.put("ATV_PANSOU_URL", "/pansou");
+        atvPaths.put("ATV_PANSOU_PLAY_URL", "/play");
+        atvPaths.put("ATV_PANSOU_GROUP_URL", "/pansou-group");
+        atvPaths.put("ATV_PANSOU_GROUP_PLAY_URL", "/play");
+        atvPaths.put("ATV_FEINIU_URL", "/feiniu");
+        atvPaths.put("ATV_FEINIU_PLAY_URL", "/feiniu-play");
+        atvPaths.put("ATV_EMBY_URL", "/emby");
+        atvPaths.put("ATV_EMBY_PLAY_URL", "/emby-play");
+        atvPaths.put("ATV_JELLYFIN_URL", "/jellyfin");
+        atvPaths.put("ATV_JELLYFIN_PLAY_URL", "/jellyfin-play");
+        atvPaths.put("ATV_TGSC_URL", "/tgsc");
+        atvPaths.put("ATV_TGSC_PLAY_URL", "/play");
+        atvPaths.put("ATV_TG_DB_URL", "/tg-db");
+        atvPaths.put("ATV_TG_DB_PLAY_URL", "/play");
+        atvPaths.put("ATV_TG_SEARCH_URL", "/tg-search");
+        atvPaths.put("ATV_TG_SEARCH_PLAY_URL", "/play");
+        atvPaths.put("ATV_TG_WEB_URL", "/tg-search");
+        atvPaths.put("ATV_TG_WEB_PLAY_URL", "/play");
+        atvPaths.put("ATV_PIAN_DAN_URL", "/pian-dan");
+        atvPaths.put("ATV_LIVE_URL", "/live");
+        // 网盘解析后端(atv_pan 段),盘搜爬虫文件夹化的关键配置
+        String backendAddress = readHostAddress();
+        json = json.replace("ATV_API_URL", backendAddress);
+        json = json.replace("ATV_TOKEN", appProperties.isEnabledToken() ? getCurrentOrFirstToken() : "-");
+        for (Map.Entry<String, String> entry : atvPaths.entrySet()) {
+            json = json.replace(entry.getKey(), readHostAddress(entry.getValue() + secret));
+        }
+        json = json.replace("VOD_URL", readHostAddress("/vod" + secret));
+        json = json.replace("VOD1_URL", readHostAddress("/vod1" + secret));
+        json = json.replace("BILIBILI_URL", readHostAddress("/bilibili" + secret));
+        json = json.replace("YOUTUBE_URL", readHostAddress("/youtube" + secret));
+        json = json.replace("EMBY_URL", readHostAddress("/emby" + secret));
+        // 凭证注入按 token 归属:u- token 只注入本人账号凭证,全局 master 凭证不下发给普通用户
+        String ali = credentialAliAccount().map(Account::getRefreshToken).orElse("");
+        json = json.replace("ALI_TOKEN", ali);
+        ali = credentialAliAccount().map(Account::getOpenToken).orElse("");
+        json = json.replace("ALI_OPEN_TOKEN", ali);
+
+        String quarkCookie = credentialQuarkAccount().map(DriverAccount::getCookie).orElse("");
+        json = json.replace("QUARK_COOKIE", quarkCookie);
+
+        String address = readHostAddress();
+        json = json.replace("DOCKER_ADDRESS", address);
+        json = json.replace("ATV_ADDRESS", address);
+        return json;
+    }
+
+
     public int syncCat() {
-        // TODO:
-        Utils.execute("rm -rf /www/cat/* && unzip -q -o /cat.zip -d /www/cat && [ -d /data/cat ] && cp -r /data/cat/* /www/cat/");
-        fileDownloader.runTask("pg");
-        fileDownloader.runTask("zx");
+        return syncCat(false);
+    }
+
+    public int syncCat(boolean auto) {
+        if (!auto || isAutoUpdateEnabled(AUTO_UPDATE_PG)) {
+            fileDownloader.runTask("pg");
+        }
+        if (!auto || isAutoUpdateEnabled(AUTO_UPDATE_ZX)) {
+            fileDownloader.runTask("zx");
+        }
+        if (!auto || isAutoUpdateEnabled(AUTO_UPDATE_XS)) {
+            fileDownloader.runTask("xs");
+        }
 
         var files = configFileService.list();
         for (var file : files) {
@@ -427,162 +690,39 @@ public class SubscriptionService {
         return 0;
     }
 
-    public Map<String, Object> open() throws IOException {
-        Path path = Utils.getWebPath("cat", "config_open.json");
-        String json = Files.readString(path).replace("\ufeff", "");
-
-        Map<String, Object> config = objectMapper.readValue(json, Map.class);
-
-        path = Utils.getWebPath("cat", "my.json");
-        if (Files.exists(path)) {
-            try {
-                log.info("read {}", path);
-                String ext = Files.readString(path);
-                Map<String, Object> source = objectMapper.readValue(ext, Map.class);
-                mergeOpen(config, source);
-            } catch (Exception e) {
-                log.warn("", e);
-            }
-        }
-
-        addCatSites(config);
-
-        json = objectMapper.writeValueAsString(config);
-        json = replaceOpen(json);
-
-        return objectMapper.readValue(json, Map.class);
-    }
-
-    private void addCatSites(Map<String, Object> config) {
-        List<Map<String, Object>> sites = getSites(config, "video");
-        Map<String, Object> site = new HashMap<>();
-        site.put("key", "youtube");
-        site.put("name", "🟢 YouTube");
-        site.put("type", 3);
-        site.put("api", "/cat/youtube.js");
-        site.put("ext", "YOUTUBE_EXT");
-        sites.add(0, site);
-
-        site = new HashMap<>();
-        site.put("key", "bilibili");
-        site.put("name", "🟢 BiliBili");
-        site.put("type", 3);
-        site.put("api", "/cat/bilibili.js");
-        site.put("ext", "BILIBILI_EXT");
-        sites.add(0, site);
-
-        site = new HashMap<>();
-        site.put("key", "xiaoya-alist");
-        site.put("name", "🟢 AList");
-        site.put("type", 3);
-        site.put("api", "/cat/xiaoya_alist.js");
-        site.put("ext", "VOD_EXT");
-        sites.add(0, site);
-
-        site = new HashMap<>();
-        site.put("key", "xiaoya-tvbox");
-        site.put("name", "🟢 小雅TV");
-        site.put("type", 3);
-        site.put("api", "/cat/xiaoya.js");
-        site.put("ext", "VOD1_EXT");
-        sites.add(0, site);
-
-        sites = getSites(config, "pan");
-        Map<String, Object> ext = new HashMap<>();
-        ext.put("name", "小雅");
-        ext.put("server", "ALIST_URL");
-        ext.put("startPage", "/");
-        ext.put("showAll", false);
-        ext.put("search", true);
-        ext.put("headers", Map.of("Authorization", "ALIST_TOKEN"));
-        if (!sites.isEmpty()) {
-            List<Map<String, Object>> list = (List<Map<String, Object>>) sites.get(0).get("ext");
-            if (list == null) {
-                list = new ArrayList<>();
-                sites.get(0).put("ext", list);
-            }
-            list.add(0, ext);
-        }
-    }
-
-    private String replaceOpen(String json) {
-        json = json.replace("./", "/cat/");
-        json = json.replace("assets://js/", "/cat/");
-        String secret = appProperties.isEnabledToken() ? ("/" + tokens.split(",")[0]) : "";
-        json = json.replace("VOD_EXT", readHostAddress("/vod" + secret));
-        json = json.replace("VOD1_EXT", readHostAddress("/vod1" + secret));
-        json = json.replace("BILIBILI_EXT", readHostAddress("/bilibili" + secret));
-        json = json.replace("YOUTUBE_EXT", readHostAddress("/youtube" + secret));
-        json = json.replace("ALIST_URL", readAListAddress());
-        String ali = accountRepository.getFirstByMasterTrue().map(Account::getRefreshToken).orElse("");
-        json = json.replace("ALI_TOKEN", ali);
-        json = json.replace("填入阿里token", ali);
-        json = json.replace("阿里token", ali);
-        String token = siteRepository.findById(1).map(Site::getToken).orElse("");
-        json = json.replace("ALIST_TOKEN", token);
-        String address = readHostAddress();
-        json = json.replace("DOCKER_ADDRESS", address);
-        json = json.replace("ATV_ADDRESS", address);
-        return json;
-    }
-
-    private void mergeOpen(Map<String, Object> config, Map<String, Object> source) {
-        log.info("merge cat config");
-        config.put("video", Map.of("sites", mergeOpen(getSites(config, "video"), getSites(source, "video"))));
-        config.put("read", Map.of("sites", mergeOpen(getSites(config, "read"), getSites(source, "read"))));
-        config.put("comic", Map.of("sites", mergeOpen(getSites(config, "comic"), getSites(source, "comic"))));
-        config.put("pan", Map.of("sites", mergeOpen(getSites(config, "pan"), getSites(source, "pan"))));
-        Object color = source.get("color");
-        if (color != null) {
-            config.put("color", color);
-        }
-        log.debug("{}", config);
-    }
-
-    private List<Map<String, Object>> getSites(Map<String, Object> config, String key) {
-        Map<String, Object> item = (Map<String, Object>) config.get(key);
-        if (item != null) {
-            try {
-                return (List<Map<String, Object>>) item.get("sites");
-            } catch (Exception e) {
-                log.warn("", e);
-            }
-        }
-        return new ArrayList<>();
-    }
-
-    private List<Map<String, Object>> mergeOpen(List<Map<String, Object>> config, List<Map<String, Object>> source) {
-        List<Map<String, Object>> list = new ArrayList<>();
-        Map<Object, Map<String, Object>> map = new HashMap<>();
-
-        for (Map<String, Object> item : config) {
-            map.put(item.get("key"), item);
-        }
-
-        if (source != null) {
-            for (Map<String, Object> item : source) {
-                if (map.containsKey(item.get("key"))) {
-                    map.get(item.get("key")).putAll(item);
-                } else {
-                    list.add(item);
-                }
-            }
-        }
-
-        list.addAll(config);
-        return list;
+    private boolean isAutoUpdateEnabled(String name) {
+        return settingRepository.findById(name)
+            .map(Setting::getValue)
+            .map("true"::equalsIgnoreCase)
+            .orElse(true);
     }
 
     public Map<String, Object> subscription(String token, String id) {
+        // u-{username}-{secret} 凭证形态归一化为裸 u-{username}:归属判定与 configUrl 均按裸口径
+        var credentialUser = userService.findUserByCredentialToken(token);
+        if (credentialUser != null) {
+            token = UserService.userVodToken(credentialUser.getUsername());
+        }
         Subscription subscription = subscriptionRepository.findBySid(id).orElseThrow(NotFoundException::new);
+        // 归属隔离:个人订阅(ownerUid>0)仅归属人本人的 u- token(或管理级共享 token)可取;
+        // 个人订阅默认 sid=数字 id,可枚举,不做校验等于向任意用户泄漏其私有上游 URL 与 override 配置
+        if (subscription.getOwnerUid() > 0 && credentialUidFor(token) != subscription.getOwnerUid()) {
+            throw new NotFoundException();
+        }
         String apiUrl = subscription.getUrl();
         String override = subscription.getOverride();
         String sort = subscription.getSort();
+        String configUrl = readHostAddress("/sub" + (StringUtils.isNotBlank(token) ? "/" + token : "") + "/" + id);
 
-        return subscription(token, apiUrl, override, sort);
+        return subscription(token, id, apiUrl, override, sort, configUrl);
     }
 
     public Map<String, Object> subscription(String token, String apiUrl, String override, String sort) {
+        return subscription(token, "", apiUrl, override, sort, "");
+    }
+
+    private Map<String, Object> subscription(String token, String subscriptionId, String apiUrl, String override, String sort,
+                                             String configUrl) {
         if (apiUrl == null) {
             apiUrl = "";
         }
@@ -597,17 +737,35 @@ public class SubscriptionService {
             overrideConfig(config, fixUrl(url.trim()), prefix, getConfigData(url.trim()));
         }
 
+        // 上游订阅的 spider 会在 overrideConfig 中直接写入全局字段,抢占 TVBox 唯一的主 spider 位,
+        // 导致本项目 spring.jar 不随订阅加载,其代理/播放同步等常驻服务不启动。
+        // 全局主 spider 固定为本项目 spring.jar;上游 spider 已在合并 sites 时降级为上游站点的 jar 属性。
+        // 用户在全局或订阅覆盖配置中显式指定 spider 时以用户为准(两处均在此后应用)。
+        config.put("spider", readHostAddress("/spring.jar"));
+
+//        injectCookies(config);
+
         sortSites(config, sort);
+
+        // 应用全局配置
+        applyGlobalConfig(config);
 
         if (StringUtils.isNotBlank(override)) {
             config = overrideConfig(config, override);
         }
 
-        addSite(token, config);
+        int order = addSite(token, subscriptionId, config, configUrl);
+
+        if (StringUtils.isNotBlank(override)) {
+            fixSiteOrder(config, order);
+        }
 
         // should after overrideConfig
-        handleWhitelist(config);
-        removeBlacklist(config);
+        resolveAndApplyFilters(config, getGlobalConfig(), parseOverride(override));
+
+        if (StringUtils.isBlank(sort)) {
+            sortSitesByOrder(config);
+        }
 
         try {
             replaceAliToken(config);
@@ -650,6 +808,11 @@ public class SubscriptionService {
     }
 
     private void replaceAliToken(Map<String, Object> config) {
+        // u- 用户 token 不注入 secret URL:该 secret 解锁 /cookies/{secret} 全量凭证端点,不得进 USER 配置。
+        // 占位符原样保留,spider 按"无 token"降级(阿里可扫码登录)
+        if (credentialUidFor(getCurrentToken()) > 0) {
+            return;
+        }
         List<Map<String, Object>> list = (List<Map<String, Object>>) config.get("sites");
         String secret = settingRepository.findById(ALI_SECRET).map(Setting::getValue).orElseThrow();
         String tokenUrl = shareRepository.countByType(0) > 0 ? readHostAddress("/ali/token/" + secret) : null;
@@ -692,11 +855,87 @@ public class SubscriptionService {
         }
     }
 
+    private void injectCookies(Map<String, Object> config) {
+        List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+        List<Map<String, Object>> list = new ArrayList<>();
+        boolean tvFan = false;
+        for (Map<String, Object> site : sites) {
+            Object ext = site.get("ext");
+            if (ext instanceof String str) {
+                if (str.contains("Cloud-drive")) {
+                    tvFan = true;
+                }
+            } else if (ext instanceof Map map) {
+                if (map.containsKey("Cloud-drive")) {
+                    tvFan = true;
+                }
+            }
+            Object api = site.get("api");
+            if (api instanceof String str) {
+                if ("csp_BiliGuard".equals(str)) {
+                    list.add(site);
+                }
+            }
+        }
+
+        if (tvFan) {
+            String cookie = settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse("");
+            for (Map<String, Object> site : list) {
+                Object ext = site.get("ext");
+                if (ext instanceof String json) {
+                    log.debug(json);
+                } else if (ext instanceof Map map) {
+                    map.put("cookie", cookie);
+                }
+            }
+        }
+    }
+
     private void sortSites(Map<String, Object> config, String sort) {
         List<Map<String, String>> list = (List<Map<String, String>>) config.get("sites");
         if (StringUtils.isNotBlank(sort)) {
             log.info("sort by filed {}", sort);
             list.sort(Comparator.comparing(a -> a.get(sort)));
+        } else {
+            List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+            if (sites == null) {
+                return;
+            }
+            int order = 5000;
+            for (Map<String, Object> site : sites) {
+                if (!site.containsKey("order")) {
+                    site.put("order", order);
+                    order += 10;
+                }
+            }
+        }
+    }
+
+    private void sortSitesByOrder(Map<String, Object> config) {
+        List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+        sites.sort(Comparator.comparing(a -> {
+            Object order = a.get("order");
+            if (order == null) {
+                return 9000;
+            } else if (order instanceof Integer) {
+                return (Integer) order;
+            } else {
+                try {
+                    return Integer.parseInt(order.toString());
+                } catch (NumberFormatException e) {
+                    return 9000;
+                }
+            }
+        }));
+    }
+
+    private void fixSiteOrder(Map<String, Object> config, int order) {
+        List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+        for (Map<String, Object> site : sites) {
+            if (!site.containsKey("order")) {
+                site.put("order", order);
+                order += 10;
+            }
         }
     }
 
@@ -748,7 +987,97 @@ public class SubscriptionService {
         return config;
     }
 
-    private void handleWhitelist(Map<String, Object> config) {
+    static List<String> normalizeWhitelist(Map<String, Object> source) {
+        if (source == null) {
+            return null;
+        }
+        Object obj = source.get("sites-whitelist");
+        if (obj instanceof List<?> list && !list.isEmpty()) {
+            List<String> result = new ArrayList<>();
+            for (Object o : list) {
+                result.add(String.valueOf(o));
+            }
+            return result;
+        }
+        return null;
+    }
+
+    static Map<String, Object> normalizeBlacklist(Map<String, Object> source) {
+        if (source == null) {
+            return null;
+        }
+        Map<String, Object> result = new HashMap<>();
+        Object blacklist = source.get("blacklist");
+        if (blacklist instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                if (e.getValue() instanceof List<?> list && !list.isEmpty()) {
+                    result.put(String.valueOf(e.getKey()), new ArrayList<>(list));
+                }
+            }
+        }
+        Object sitesBlacklist = source.get("sites-blacklist");
+        if (sitesBlacklist instanceof List<?> list && !list.isEmpty()) {
+            List<Object> sites = (List<Object>) result.computeIfAbsent("sites", k -> new ArrayList<>());
+            for (Object o : list) {
+                if (!sites.contains(o)) {
+                    sites.add(o);
+                }
+            }
+        }
+        return result.isEmpty() ? null : result;
+    }
+
+    static void resolveAndApplyFilters(Map<String, Object> config, Map<String, Object> globalConfig, Map<String, Object> override) {
+        List<String> globalWhitelist = normalizeWhitelist(globalConfig);
+        Map<String, Object> globalBlacklist = normalizeBlacklist(globalConfig);
+        List<String> subWhitelist = normalizeWhitelist(override);
+        Map<String, Object> subBlacklist = normalizeBlacklist(override);
+
+        // 清除合并残留,避免外泄/重复应用
+        config.remove("sites-whitelist");
+        config.remove("sites-blacklist");
+        config.remove("blacklist");
+
+        List<String> finalWhitelist;
+        Map<String, Object> finalBlacklist;
+        if (subWhitelist != null) {
+            finalWhitelist = subWhitelist;
+            finalBlacklist = null;
+        } else if (subBlacklist != null) {
+            finalWhitelist = null;
+            finalBlacklist = subBlacklist;
+        } else if (globalWhitelist != null) {
+            finalWhitelist = globalWhitelist;
+            finalBlacklist = null;
+        } else {
+            finalWhitelist = null;
+            finalBlacklist = globalBlacklist;
+        }
+
+        if (finalWhitelist != null) {
+            config.put("sites-whitelist", finalWhitelist);
+            handleWhitelist(config); // 白名单模式忽略黑名单
+        } else {
+            if (finalBlacklist != null) {
+                config.put("blacklist", finalBlacklist);
+            }
+            removeBlacklist(config); // 应用黑名单对象 + 始终移除 Alist1
+        }
+    }
+
+    private Map<String, Object> parseOverride(String override) {
+        if (StringUtils.isBlank(override)) {
+            return new HashMap<>();
+        }
+        try {
+            return objectMapper.readValue(override, Map.class);
+        } catch (Exception e) {
+            log.warn("parse override for filters failed", e);
+            return new HashMap<>();
+        }
+    }
+
+    private static void handleWhitelist(Map<String, Object> config) {
         try {
             Object obj1 = config.get("sites-whitelist");
             Object obj2 = config.get("sites");
@@ -764,7 +1093,7 @@ public class SubscriptionService {
         }
     }
 
-    private void removeBlacklist(Map<String, Object> config) {
+    private static void removeBlacklist(Map<String, Object> config) {
         try {
             Object obj1 = config.get("sites-blacklist");
             if (obj1 == null) {
@@ -799,7 +1128,7 @@ public class SubscriptionService {
         }
     }
 
-    private void removeBlacklist(Map<String, Object> config, Map<String, Object> blacklist, String type) {
+    private static void removeBlacklist(Map<String, Object> config, Map<String, Object> blacklist, String type) {
         Object obj1 = blacklist.get(type);
         if (obj1 == null) {
             obj1 = new ArrayList<String>(); // to remove Alist1 site
@@ -832,6 +1161,7 @@ public class SubscriptionService {
             json = json.replace("ATV_ADDRESS", address);
             json = json.replace("BILI_COOKIE", settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse(""));
             json = json.replace("TOKEN", getCurrentOrFirstToken());
+            json = json.replace("WALLPAPER_API", address + "/wallpaper/" + getCurrentOrFirstToken());
             Map<String, Object> override = objectMapper.readValue(json, Map.class);
             overrideConfig(config, null, "", override);
             return replaceString(config, override);
@@ -885,8 +1215,10 @@ public class SubscriptionService {
                         if (StringUtils.isNotBlank(spider) && url != null) {
                             spider = resolveUrl(url, spider);
                         }
+                    } else if ("headers".equals(key)) {
+                        keyName = "host";
                     }
-                    log.debug("overrideConfig: {} {}", key, value);
+                    log.debug("overrideConfig: {} {} {}", key, keyName, value);
                     overrideList(config, override, prefix, spider, key, keyName);
                 } else {
                     config.put(key, value);
@@ -913,6 +1245,9 @@ public class SubscriptionService {
 
     private static void fixApiUrl(Map<String, Object> config, URL url) {
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+        if (sites == null) {
+            return;
+        }
         for (Map<String, Object> site : sites) {
             Object api = site.get("api");
             if (api instanceof String apiUrl) {
@@ -931,6 +1266,9 @@ public class SubscriptionService {
 
     private static void fixExtUrl(Map<String, Object> config, URL url) {
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+        if (sites == null) {
+            return;
+        }
         for (Map<String, Object> site : sites) {
             Object ext = site.get("ext");
             if (ext instanceof String extUrl) {
@@ -1048,34 +1386,189 @@ public class SubscriptionService {
         return UUID.randomUUID().toString().replace("-", "");
     }
 
-    private void addSite(String token, Map<String, Object> config) {
+    private int addSite(String token, String subscriptionId, Map<String, Object> config, String configUrl) {
         int id = 0;
+        int order = 1000;
         List<Map<String, Object>> sites = (List<Map<String, Object>>) config.get("sites");
+        if (sites == null) {
+            sites = new ArrayList<>();
+            config.put("sites", sites);
+        }
         String uid = generateUid();
+        String playbackToken = playbackTokenForSubscription(token, subscriptionId);
+        // 共享 token → ali_secret(管理员设备,全量凭证);u- 用户 token → u-{username}-{vod_secret}
+        //(凭证下载密钥:u-{username} 无熵不能当授权,熵来自随机 vodSecret),
+        // spider 调 /cookies/{secret} 时服务端校验密钥后按归属只回本人账号凭证
+        String secret = token.startsWith(USER_TOKEN_PREFIX)
+                ? token + "-" + userService.vodSecretOf(userService.findByUserVodToken(token))
+                : settingRepository.findById(ALI_SECRET).map(Setting::getValue).orElseThrow();
+        // 配置里嵌入的 token 一律升级为凭证形态:spider 拿它调 /vod、tokenm 等,
+        // 裸 u-{username} 可猜测,凭证明文下发只认带密钥形态
+        String embedToken = token.startsWith(USER_TOKEN_PREFIX) ? secret : token;
         for (SubscriptionSourceService.SubscriptionSourceRef source : subscriptionSourceService.findEnabledSources()) {
             try {
                 if (source.builtin()) {
-                    Map<String, Object> site = buildSite(token, uid, source.siteKey(), source.name());
-                    if ("csp_AList".equals(source.siteKey())) {
-                        sites.removeIf(item -> "Alist".equals(item.get("key")));
-                    } else if ("csp_TgDouBan".equals(source.siteKey())) {
-                        site.put("searchable", 0);
-                        site.put("quickSearch", 0);
-                    } else if ("csp_Push".equals(source.siteKey())) {
-                        site.put("key", "push_agent");
-                        site.put("searchable", 0);
-                        site.put("quickSearch", 0);
-                        sites.removeIf(item -> "push_agent".equals(item.get("key")));
+                    if (WEB_HOME_KEY.equals(source.siteKey())) {
+                        // WebHome 网页首页站:单形态通吃(webhtv/fish 按 homePage 字段原生渲染,
+                        // 字段驱动与 api 名无关;普通端由 spring.jar csp_WebHome spider 弹窗加载);
+                        // 启用/顺序/名称来自订阅源管理
+                        Map<String, Object> site = buildWebHomeSite(token, source.name(), playbackToken);
+                        site.put("order", order);
+                        applySiteOverride(WEB_HOME_KEY, site, sites);
+                        sites.add(id++, site);
+                        log.debug("add builtin source {}: {}", source.siteKey(), site);
+                    } else {
+                        Map<String, Object> site = buildSite(embedToken, secret, uid, source.siteKey(), source.name(),
+                                playbackToken, configUrl);
+                        site.put("order", order);
+                        // key transformation for csp_Push (needed before override lookup)
+                        if ("csp_Push".equals(source.siteKey())) {
+                            site.put("key", "push_agent");
+                        }
+                        if ("csp_AList".equals(source.siteKey())) {
+                            sites.removeIf(item -> "Alist".equals(item.get("key")));
+                        } else if ("csp_Push".equals(source.siteKey())) {
+                            sites.removeIf(item -> "push_agent".equals(item.get("key")));
+                        }
+                        // apply user override from config.sites (partial entry added by overrideConfig)
+                        String overrideKey = (String) site.get("key");
+                        boolean overridden = applySiteOverride(overrideKey, site, sites);
+                        // special defaults when no user override
+                        applyBuiltinSiteCapabilities(source.siteKey(), overridden, site);
+                        sites.add(id++, site);
+                        log.debug("add builtin source {}: {}", source.siteKey(), site);
                     }
-                    sites.add(id++, site);
-                    log.debug("add builtin source {}: {}", source.siteKey(), site);
                 } else if (source.plugin() != null) {
-                    sites.add(id++, buildPluginSite(source.plugin(), token));
+                    Map<String, Object> site;
+                    if (PluginService.isWebPagePlugin(source.plugin())) {
+                        // 自定义网页源(webhome/pages/*.html):csp_WebHome 形态,非 spider 插件站点
+                        site = buildWebPageSite(source.plugin(), playbackToken);
+                    } else {
+                        site = buildPluginSite(source.plugin(), embedToken, secret,
+                                playbackToken, configUrl);
+                    }
+                    site.put("order", order);
+                    String overrideKey = (String) site.get("key");
+                    applySiteOverride(overrideKey, site, sites);
+                    sites.add(id++, site);
                 }
+                order += 10;
             } catch (Exception e) {
                 log.warn("add source failed: {}", source.id(), e);
             }
         }
+        return order;
+    }
+
+    /**
+     * WebHome 自定义网页首页站点:单形态通吃所有客户端 —— homePage 字段(webhtv/fish 按
+     * site.hasHomePage() 字段驱动原生渲染,与 api 名无关,已核 fish_webhtv HomeWebController)
+     * + api=csp_WebHome(原版 FongMi/OK影视 无 homePage 概念,由 spring.jar spider 全屏
+     * WebView 加载 ext 里的同一 URL,注入最小 fm SDK)。同一 URL 同一 token,页面零改动;
+     * 能力探测记忆(WebHomeService)不再参与形态选择 —— 同 token 多设备混用(一台 webhtv
+     * 把 token 标成能力端,同 token 的原版端曾因此拿到解析不了的原生形态)无法在配置拉取时
+     * 区分客户端,双形态必错一边。ext 为明文 JSON 字符串(spider 端兼容 base64/裸 URL)。
+     * 随订阅源管理(可禁用/调序/改名)下发。
+     */
+    private Map<String, Object> buildWebHomeSite(String token, String name, String playbackToken) {
+        String homeToken = token.isBlank() ? "-" : token;
+        // 绝对地址:多接口(@)拼接/反代场景下相对路径会解析错;token 供页面调 /media 数据
+        // v= 页面版本:WebView 对 homePage URL 有缓存,页面改动必须 bump 强制重载
+        String pageUrl = readHostAddress("") + "/webhome/app.html?token=" + homeToken + "&v=20";
+        // pt 内嵌页面 URL:页面可直接 fetch /api/playback/changes(同源+请求头),继续观看
+        // 不再依赖 spider 桥/SDK 注入 —— 桥全挂也能出数据(桥兜底仍保留,双保险)
+        if (StringUtils.isNotBlank(playbackToken)) {
+            pageUrl += "&pt=" + playbackToken;
+        }
+        Map<String, Object> site = buildWebHomeLikeSite(WEB_HOME_KEY, name, pageUrl, playbackToken);
+        log.debug("add WebHome site: token={}", homeToken);
+        return site;
+    }
+
+    /**
+     * 自定义网页源站点(static/webhome/pages/*.html 自动注册,名称可在订阅源管理改):
+     * 与内置影视首页同款 csp_WebHome 单形态;页面地址经 /webhome/** no-cache,无需版本号。
+     */
+    private Map<String, Object> buildWebPageSite(Plugin plugin, String playbackToken) {
+        String pageUrl = readHostAddress("") + PluginService.webPageUrl(plugin);
+        if (StringUtils.isNotBlank(playbackToken)) {
+            pageUrl += "?pt=" + playbackToken;
+        }
+        Map<String, Object> site = buildWebHomeLikeSite(
+                PluginService.webPageSiteKey(plugin),
+                StringUtils.defaultIfBlank(plugin.getName(), "网页"),
+                pageUrl, playbackToken);
+        log.debug("add web page site: {} -> {}", site.get("key"), pageUrl);
+        return site;
+    }
+
+    /** csp_WebHome 站点公共字段(内置影视首页与自定义网页源共用)。 */
+    private Map<String, Object> buildWebHomeLikeSite(String key, String name, String pageUrl, String playbackToken) {
+        Map<String, Object> site = new HashMap<>();
+        site.put("key", key);
+        site.put("name", StringUtils.defaultIfBlank(name, "影视首页"));
+        site.put("type", 3);
+        site.put("api", "csp_WebHome");
+        site.put("homePage", pageUrl);
+        site.put("searchable", 0);
+        site.put("quickSearch", 0);
+        site.put("filterable", 0);
+        site.put("changeable", 0);
+        // 显式 jar(与其他内置源一致):防宿主不回落全局 spider 或全局位被覆盖
+        site.put("jar", readHostAddress("") + "/spring.jar");
+        Map<String, Object> ext = new HashMap<>();
+        ext.put("url", pageUrl);
+        // 播放同步专用令牌(订阅 token 过不了 /api/playback 的 X-PlaySync-Token 鉴权):
+        // spider fm.history 桥的兜底数据源 —— 服务端播放记录(跨设备继续观看)
+        ext.put("pt", StringUtils.defaultString(playbackToken));
+        try {
+            // base64(JSON),与 csp_Media 等其它源一致(spider 端 parseExt 先试 base64,兼容明文)
+            site.put("ext", Base64.getEncoder().encodeToString(
+                    objectMapper.writeValueAsString(ext).replaceAll("\\s", "").getBytes()));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("encode WebHome ext failed", e);
+        }
+        return site;
+    }
+
+    static void applyBuiltinSiteCapabilities(String key, boolean overridden, Map<String, Object> site) {
+        if (("csp_TgDouBan".equals(key) || "csp_Push".equals(key)) && !overridden) {
+            site.put("searchable", 0);
+            site.put("quickSearch", 0);
+        }
+        if ("csp_PianDan".equals(key)) {
+            site.put("indexs", 1);
+            site.put("searchable", 0);
+            site.put("quickSearch", 0);
+            site.put("filterable", 1);
+        }
+    }
+
+    /**
+     * Find a partial site entry in config.sites (added by overrideConfig for builtin/plugin keys)
+     * and merge its override fields into the fully-built site, then remove the partial entry.
+     *
+     * @return true if an override was found and applied
+     */
+    private boolean applySiteOverride(String key, Map<String, Object> site, List<Map<String, Object>> sites) {
+        Iterator<Map<String, Object>> it = sites.iterator();
+        while (it.hasNext()) {
+            Map<String, Object> existing = it.next();
+            if (key.equals(existing.get("key"))) {
+                // merge ext maps if both are maps
+                Object ext1 = site.get("ext");
+                Object ext2 = existing.get("ext");
+                if (ext1 instanceof Map extMap1 && ext2 instanceof Map extMap2) {
+                    extMap1.putAll(extMap2);
+                    existing.put("ext", extMap1);
+                }
+                site.putAll(existing);
+                it.remove();
+                log.debug("apply site override for builtin/plugin: {}", key);
+                return true;
+            }
+        }
+        return false;
     }
 
     public Map<String, Boolean> getCapabilities() {
@@ -1084,6 +1577,7 @@ public class SubscriptionService {
         map.put("jellyfin", jellyfinRepository.count() > 0);
         map.put("feiniu", feiniuRepository.count() > 0);
         map.put("pansou", StringUtils.isNotBlank(appProperties.getPanSouUrl()));
+        map.put("telegram_channel", StringUtils.isNotBlank(appProperties.getTgSearch()));
         map.put("bilibili", StringUtils.isNotBlank(settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse("")));
         Site site = siteRepository.findById(1).orElse(null);
         map.put("xiaoya", site != null);
@@ -1106,7 +1600,76 @@ public class SubscriptionService {
                 .orElse(false);
     }
 
-    private Map<String, Object> buildSite(String token, String uid, String key, String name) throws IOException {
+    /** 用户名订阅归属该用户；普通共享订阅归属管理员。syncScope 按订阅分区模式算定。 */
+    private String playbackTokenForSubscription(String subscriptionToken, String subscriptionId) {
+        if (!appProperties.isPlaybackSyncEnabled()) {
+            log.debug("playback sync subscription disabled");
+            return "";
+        }
+        var user = StringUtils.isBlank(subscriptionToken) ? null : userService.findUserByCredentialToken(subscriptionToken);
+        if (user == null) {
+            user = StringUtils.isBlank(subscriptionToken) ? null : userService.findByUserVodToken(subscriptionToken);
+        }
+        if (user == null) {
+            user = userService.list().stream()
+                    .filter(candidate -> candidate.getRole() == Role.ADMIN)
+                    .min(Comparator.comparingInt(candidate -> candidate.getId() == null ? Integer.MAX_VALUE : candidate.getId()))
+                    .orElse(null);
+        }
+        if (user == null || user.getId() == null) {
+            return "";
+        }
+        String syncScope = computeSyncScope(subscriptionToken, subscriptionId);
+        String playbackToken = playbackTokenForUid(user.getId(), syncScope);
+        log.debug("playback sync subscription: ownerUid={}, syncScope={}, tokenConfigured={}",
+                user.getId(), syncScope, StringUtils.isNotBlank(playbackToken));
+        return playbackToken;
+    }
+
+    /**
+     * 按 playback_sync_scope 模式算订阅分区。vod token 机制关闭(token 空/"-")或 uid 模式 → null(uid 级,
+     * 所有订阅互通);token 模式 → vod token;subscription 模式 → vod token/id。
+     */
+    private String computeSyncScope(String subscriptionToken, String subscriptionId) {
+        if (subscriptionToken == null || subscriptionToken.isBlank() || "-".equals(subscriptionToken)) {
+            return null;
+        }
+        String mode = appProperties.getPlaybackSyncScope();
+        return switch (mode) {
+            case "subscription" -> subscriptionId != null && !subscriptionId.isBlank()
+                    ? subscriptionToken + "/" + subscriptionId
+                    : subscriptionToken;
+            case "uid" -> null;
+            default -> subscriptionToken;
+        };
+    }
+
+    /** 该用户(uid)在指定分区的播放同步令牌；首次生成订阅时按 (uid, syncScope) 创建，后续复用。 */
+    private synchronized String playbackTokenForUid(Integer uid, String syncScope) {
+        if (uid == null) {
+            return "";
+        }
+        PlaybackToken existing = syncScope == null
+                ? playbackTokenRepository.findByUidAndSyncScopeIsNull(uid).stream().findFirst().orElse(null)
+                : playbackTokenRepository.findByUidAndSyncScope(uid, syncScope).orElse(null);
+        if (existing != null) {
+            return existing.getToken();
+        }
+        PlaybackToken created = new PlaybackToken();
+        created.setUid(uid);
+        created.setSyncScope(syncScope);
+        created.setName(SYSTEM_PLAYBACK_TOKEN_NAME);
+        created.setToken(UUID.randomUUID().toString().replace("-", ""));
+        long now = System.currentTimeMillis();
+        created.setCreatedTime(now);
+        created.setLastUsedAt(now);
+        playbackTokenRepository.save(created);
+        log.info("created system playback sync token for uid={}, syncScope={}", uid, syncScope);
+        return created.getToken();
+    }
+
+    private Map<String, Object> buildSite(String token, String secret, String uid, String key, String name,
+                                          String playbackToken, String configUrl) throws IOException {
         String url = readHostAddress("");
         Map<String, Object> site = new HashMap<>();
         site.put("key", key);
@@ -1116,7 +1679,10 @@ public class SubscriptionService {
         Map<String, Object> map = new HashMap<>();
         map.put("api", url);
         map.put("token", token.isBlank() ? "-" : token);
+        map.put("secret", secret);
         map.put("uid", uid);
+        map.put("playbackToken", playbackToken);
+        map.put("playbackConfigUrl", configUrl);
         map.put("local_proxy_config", readLocalProxyConfig());
         String ext = objectMapper.writeValueAsString(map).replaceAll("\\s", "");
         ext = Base64.getEncoder().encodeToString(ext.getBytes());
@@ -1136,7 +1702,109 @@ public class SubscriptionService {
         return site;
     }
 
-    private Map<String, Object> buildPluginSite(Plugin plugin, String token) throws JsonProcessingException {
+    static String selectPluginApi(Plugin plugin, boolean nativePython, String baseUrl) {
+        if (PluginService.isPythonPluginUrl(plugin.getUrl())) {
+            return "csp_PyProxy";
+        }
+        return nativePython ? atvpUrl(baseUrl) : "csp_PyProxy";
+    }
+
+    private static String atvpUrl(String baseUrl) {
+        return baseUrl + "/Atvp.py?v=" + ATVP_RUNTIME_REVISION;
+    }
+
+    static String preheatManifestUrl(String baseUrl, String token) {
+        return baseUrl + "/plugin-preheat/" + token;
+    }
+
+    /**
+     * 插件预热清单:全部启用插件的密文地址(带版本参数),常用插件排前。
+     * 客户端(spring.jar 与 Atvp.py)冷启动后台按清单预下载密文到本地缓存,
+     * 首次切换站点与全局搜索时免逐个网络下载。必须先经 checkToken 建立请求上下文,
+     * 与 ext 里的 source 地址保持同一 contentToken、同一拼法,客户端缓存才能命中。
+     */
+    public Map<String, Object> buildPreheatManifest() {
+        String baseUrl = readHostAddress("");
+        String contentToken = getCurrentOrFirstToken();
+        List<Plugin> plugins = new ArrayList<>(pluginRepository.findByEnabledTrueOrderBySortOrderAscIdAsc());
+
+        Map<String, Long> usage = new HashMap<>();
+        for (SourceKeyUsageCount count : historyRepository.countBySourceKey("spider_plugin")) {
+            if (count.getSourceKey() != null) {
+                usage.put(count.getSourceKey(), count.getTotal());
+            }
+        }
+        plugins.sort(Comparator
+                .comparingLong((Plugin plugin) -> usage.getOrDefault(pluginSiteKey(plugin), 0L)).reversed()
+                .thenComparing(Plugin::getSortOrder, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(Plugin::getId, Comparator.nullsLast(Comparator.naturalOrder())));
+
+        List<Map<String, Object>> items = new ArrayList<>();
+        for (Plugin plugin : plugins) {
+            Map<String, Object> item = new HashMap<>();
+            item.put("url", pluginContentUrl(baseUrl, contentToken, plugin));
+            item.put("key", pluginSiteKey(plugin));
+            item.put("name", plugin.getName());
+            items.add(item);
+        }
+        Map<String, Object> manifest = new HashMap<>();
+        manifest.put("plugins", items);
+        log.info("built plugin preheat manifest: {} plugins, top={}", items.size(),
+                items.isEmpty() ? "-" : items.get(0).get("key"));
+        return manifest;
+    }
+
+    /**
+     * 插件密文内容地址。version 参数让地址兼作客户端预下载缓存的 key:
+     * 插件更新后版本变化,订阅配置刷新即换地址,旧缓存自然失效。
+     */
+    static String pluginContentUrl(String baseUrl, String token, Plugin plugin) {
+        boolean rawPython = PluginService.isPythonPluginUrl(plugin.getUrl());
+        String extension = rawPython ? ".py" : ".txt";
+        String url = baseUrl + "/plugins/" + token + "/" + plugin.getId() + extension;
+        if (plugin.getVersion() != null) {
+            url += "?v=" + plugin.getVersion();
+        }
+        return url;
+    }
+
+    static Map<String, Object> buildPluginExtPayload(Plugin plugin,
+                                                     String baseUrl,
+                                                     String contentToken,
+                                                     String token,
+                                                     String secret,
+                                                     boolean nativePython,
+                                                     Map<String, Object> localProxyConfig) {
+        Map<String, Object> map = new HashMap<>();
+        map.put("api", baseUrl);
+        String contentUrl = pluginContentUrl(baseUrl, contentToken, plugin);
+        if (PluginService.isPythonPluginUrl(plugin.getUrl())) {
+            map.put("loader", atvpUrl(baseUrl));
+            map.put("source", contentUrl);
+            map.put("raw", true);
+        } else {
+            map.put("source", contentUrl);
+            if (!nativePython) {
+                map.put("loader", atvpUrl(baseUrl));
+            }
+        }
+        map.put("preheatUrl", preheatManifestUrl(baseUrl, contentToken));
+        map.put("token", token.isBlank() ? "-" : token);
+        map.put("secret", secret);
+        map.put("playbackSourceKind", "spider_plugin");
+        map.put("playbackSourceKey", pluginSiteKey(plugin));
+        map.put("playbackSourceName", plugin.getName());
+        // 代理配置对所有运行模式下发:Java 转发由 PyProxy 读它调 VideoStreamProxy;
+        // Python 原生由 Atvp.py 读它,向后端声明 client-proxy 取直链,再经本地 /player 接口改写为分片代理地址。
+        map.put("local_proxy_config", localProxyConfig);
+        if (StringUtils.isNotBlank(plugin.getExtend())) {
+            map.put("data", plugin.getExtend());
+        }
+        return map;
+    }
+
+    private Map<String, Object> buildPluginSite(Plugin plugin, String token, String secret,
+                                                String playbackToken, String configUrl) throws JsonProcessingException {
         Map<String, Object> site = new HashMap<>();
         site.put("filterable", 1);
         site.put("quickSearch", 1);
@@ -1144,23 +1812,28 @@ public class SubscriptionService {
         site.put("changeable", 0);
         String url = readHostAddress("");
         boolean nativePython = isNativePythonPluginRunMode();
-        site.put("api", nativePython ? url + "/Atvp.py" : "csp_PyProxy");
+        site.put("api", selectPluginApi(plugin, nativePython, url));
         site.put("type", 3);
-        site.put("key", plugin.getName());
+        site.put("key", pluginSiteKey(plugin));
         site.put("searchable", 1);
         String jar = url + "/spring.jar";
         site.put("jar", jar);
 
-        Map<String, Object> map = new HashMap<>();
-        map.put("api", url);
-        //map.put("loader", url + "/Atvp.py");
-        String source = readHostAddress("") + "/plugins/" + getCurrentOrFirstToken() + "/" + plugin.getId() + ".txt";
-        map.put("source", source);
-        map.put("token", token.isBlank() ? "-" : token);
-        map.put("local_proxy_config", nativePython ? new HashMap<>() : readLocalProxyConfig());
-        if (StringUtils.isNotBlank(plugin.getExtend())) {
-            map.put("data", plugin.getExtend());
+        if ("8cdcaa4255534ca19aaa18948ea9c3524c1d".equals(plugin.getExternalId())) {
+            site.put("indexs", 1);
         }
+
+        Map<String, Object> map = buildPluginExtPayload(
+                plugin,
+                url,
+                getCurrentOrFirstToken(),
+                token,
+                secret,
+                nativePython,
+                readLocalProxyConfig()
+        );
+        map.put("playbackToken", playbackToken);
+        map.put("playbackConfigUrl", configUrl);
         // 每个插件站点只下发与自己作用域匹配的过滤器
         List<Map<String, Object>> filters = buildPluginFilters(plugin);
         if (!filters.isEmpty()) {
@@ -1286,16 +1959,35 @@ public class SubscriptionService {
                 file = Utils.getWebPath("tvbox", name);
                 folder = "/tvbox/" + getFolder(name);
             }
+            // 安全:规范化后必须仍位于 web 根(/www)之下,杜绝 ../ 或绝对路径穿越读取任意文件(如 /etc/passwd、/opt/alist/data/config.json)
+            Path webRoot = Utils.getWebPath().toAbsolutePath().normalize();
+            Path resolved = file.toAbsolutePath().normalize();
+            if (!resolved.startsWith(webRoot)) {
+                log.warn("rejected config path outside web root: {}", name);
+                return null;
+            }
+            file = resolved;
             if (Files.exists(file)) {
                 log.info("load json from {}", file);
                 String json = Files.readString(file);
                 String address = readHostAddress();
-                String token = getCurrentOrFirstToken();
+                // String token = getCurrentOrFirstToken();
                 json = appendMd5sum(name, json);
-                json = json.replace("./lib/tokenm.json", address + "/pg/lib/tokenm" + (StringUtils.isBlank(token) ? "" : "?token=" + token));
-                json = json.replace("./peizhi.json", address + "/zx/config" + (StringUtils.isBlank(token) ? "" : "?token=" + token));
-                json = json.replace("./json/peizhi.json", address + "/zx/config" + (StringUtils.isBlank(token) ? "" : "?token=" + token));
-                json = json.replace("tvfan/Cloud-drive.txt", address + "/tvfan/config" + (StringUtils.isBlank(token) ? "" : "?token=" + token));
+                // 用当前请求 token(订阅 token、USER 用户名、或无 token 的 "")原样注入;仅 currentToken==null(未走 checkToken 的可信内部/管理端,如 getCatalog)才回退全局首个订阅 token。
+                // 关键:/sub/{id} 等用户路径会经 checkToken 把 currentToken 设为 "",不算"内部",不注入全局 —— 避免无 token 客户端拿到全局订阅 token 再访问 tokenm/zx/tvfan
+                // 例外:亲友共享模式(anonymousAccess)下用户显式接受该泄漏面,匿名请求也注入首个 token,老订阅地址零改动
+                String currentReqToken = currentToken.get();
+                String subToken = currentReqToken != null ? currentReqToken : getFirstSubscriptionToken();
+                if (StringUtils.isBlank(subToken) && anonymousAccess) {
+                    subToken = getFirstSubscriptionToken();
+                }
+                // u- 用户 token 升级为凭证形态再入 URL:tokenm 只认带密钥形态(裸 u- 无熵),
+                // zx/tvfan 目前本就只收共享 token,嵌入哪种都会 400,不影响
+                subToken = userService.toCredentialToken(subToken);
+                json = json.replace("./lib/tokenm.json", address + "/pg/lib/tokenm" + (StringUtils.isBlank(subToken) ? "" : "?token=" + subToken));
+                json = json.replace("./peizhi.json", address + "/zx/config" + (StringUtils.isBlank(subToken) ? "" : "?token=" + subToken));
+                json = json.replace("./json/peizhi.json", address + "/zx/config" + (StringUtils.isBlank(subToken) ? "" : "?token=" + subToken));
+                json = json.replace("tvfan/Cloud-drive.txt", address + "/tvfan/config" + (StringUtils.isBlank(subToken) ? "" : "?token=" + subToken));
                 json = json.replace("./", address + folder);
                 //json = json.replace(address + folder + "lib/tokenm.json", "./lib/tokenm.json");
                 json = json.replace("DOCKER_ADDRESS", address);
@@ -1395,7 +2087,7 @@ public class SubscriptionService {
                 }
                 json = ECB(content, configKey);
             } else {
-                json = content;
+                json = ConfigPayloadExtractor.extract(content);
             }
 
             int index = json.indexOf('{');
@@ -1409,8 +2101,14 @@ public class SubscriptionService {
             json = json.replace("{Cloud-drive", "{\"Cloud-drive");
             if (json.contains("tvfan/Cloud-drive.txt")) {
                 String address = readHostAddress();
-                String token = getCurrentOrFirstToken();
-                json = json.replace("tvfan/Cloud-drive.txt", address + "/tvfan/config" + (StringUtils.isBlank(token) ? "" : "?token=" + token));
+                // 同 loadLocalConfigJson:用户请求(含空 token "")原样注入,仅 currentToken==null 的可信内部场景回退全局首个;
+                // 亲友共享模式下匿名请求同样回退首个 token
+                String currentReqToken = currentToken.get();
+                String subToken = currentReqToken != null ? currentReqToken : getFirstSubscriptionToken();
+                if (StringUtils.isBlank(subToken) && anonymousAccess) {
+                    subToken = getFirstSubscriptionToken();
+                }
+                json = json.replace("tvfan/Cloud-drive.txt", address + "/tvfan/config" + (StringUtils.isBlank(subToken) ? "" : "?token=" + subToken));
             }
 
             return objectMapper.readValue(json, Map.class);
@@ -1508,5 +2206,136 @@ public class SubscriptionService {
         }
         Map<String, Object> map = Map.of("urls", urls);
         return objectMapper.writeValueAsString(map);
+    }
+
+    public Map<String, Object> getCatalog(String sid) {
+        Subscription sub = subscriptionRepository.findBySid(sid).orElseThrow(NotFoundException::new);
+        String apiUrl = sub.getUrl() == null ? "" : sub.getUrl();
+        Map<String, Object> config = new HashMap<>();
+        // 与 subscription() 保持一致:apiUrl 为空时也要处理空串(加载默认 my.json 的上游站点)
+        for (String url : apiUrl.split(",")) {
+            String[] parts = url.split("@", 2);
+            String prefix = "";
+            if (parts.length == 2) {
+                prefix = parts[0].trim() + "@";
+                url = parts[1].trim();
+            }
+            overrideConfig(config, fixUrl(url.trim()), prefix, getConfigData(url.trim()));
+        }
+        return buildCatalog(config, subscriptionSourceService.findEnabledSources());
+    }
+
+    static Map<String, Object> buildCatalog(Map<String, Object> config, List<SubscriptionSourceService.SubscriptionSourceRef> sources) {
+        Set<String> builtinPluginKeys = new HashSet<>();
+        List<Map<String, Object>> sourceSites = new ArrayList<>();
+        for (SubscriptionSourceService.SubscriptionSourceRef source : sources) {
+            String key;
+            String origin;
+            if (source.builtin()) {
+                key = "csp_Push".equals(source.siteKey()) ? "push_agent" : source.siteKey();
+                origin = "builtin";
+            } else if (source.plugin() != null) {
+                key = pluginSiteKey(source.plugin());
+                origin = "plugin";
+            } else {
+                continue;
+            }
+            if (key == null) {
+                continue;
+            }
+            builtinPluginKeys.add(key);
+            // atv_home(影视首页)单形态通吃后即常规站点条目,随目录返回 —— 白名单模式必须可选,
+            // 否则影视首页被订阅级白名单过滤(该订阅看不到首页);key 参与去重,上游手写条目不以 upstream 形态重复
+            Map<String, Object> item = new HashMap<>();
+            item.put("key", key);
+            item.put("name", source.name() == null ? key : source.name());
+            item.put("origin", origin);
+            sourceSites.add(item);
+        }
+
+        List<Map<String, Object>> upstream = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        Object sitesObj = config.get("sites");
+        if (sitesObj instanceof List<?> list) {
+            for (Object o : list) {
+                if (!(o instanceof Map<?, ?> s) || s.get("key") == null) {
+                    continue;
+                }
+                String key = String.valueOf(s.get("key"));
+                if (builtinPluginKeys.contains(key) || !seen.add(key)) {
+                    continue;
+                }
+                Map<String, Object> item = new HashMap<>();
+                item.put("key", key);
+                item.put("name", s.get("name") == null ? key : s.get("name"));
+                item.put("origin", "upstream");
+                upstream.add(item);
+            }
+        }
+
+        List<Map<String, Object>> parses = new ArrayList<>();
+        Object parsesObj = config.get("parses");
+        if (parsesObj instanceof List<?> list) {
+            for (Object o : list) {
+                if (o instanceof Map<?, ?> p && p.get("name") != null) {
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("name", String.valueOf(p.get("name")));
+                    parses.add(item);
+                }
+            }
+        }
+
+        List<Map<String, Object>> allSites = new ArrayList<>();
+        allSites.addAll(sourceSites);
+        allSites.addAll(upstream);
+        Map<String, Object> result = new HashMap<>();
+        result.put("sites", allSites);
+        result.put("parses", parses);
+        return result;
+    }
+
+    /** 插件显示名允许重命名；订阅站点 key 必须使用跨设备稳定的 manifest id。 */
+    static String pluginSiteKey(Plugin plugin) {
+        // 自定义网页源:站点目录 key 与下发的 csp_WebHome 站点 key 保持一致(配置编辑器归类为受管源)
+        if (PluginService.isWebPagePlugin(plugin)) {
+            return PluginService.webPageSiteKey(plugin);
+        }
+        if (StringUtils.isNotBlank(plugin.getExternalId())) {
+            return plugin.getExternalId();
+        }
+        return "plugin-" + plugin.getId();
+    }
+
+    public Map<String, Object> getGlobalConfig() {
+        return settingRepository.findById(Constants.GLOBAL_SUBSCRIPTION_OVERRIDE)
+                .map(Setting::getValue)
+                .map(json -> {
+                    try {
+                        return objectMapper.readValue(json, Map.class);
+                    } catch (Exception e) {
+                        log.warn("Failed to parse global config", e);
+                        return new HashMap<String, Object>();
+                    }
+                })
+                .orElse(new HashMap<>());
+    }
+
+    public void updateGlobalConfig(Map<String, Object> config) {
+        try {
+            String json = objectMapper.writeValueAsString(config);
+            settingRepository.save(new Setting(Constants.GLOBAL_SUBSCRIPTION_OVERRIDE, json));
+        } catch (Exception e) {
+            log.warn("Failed to save global config", e);
+            throw new BadRequestException("Invalid config format");
+        }
+    }
+
+    private void applyGlobalConfig(Map<String, Object> config) {
+        String json = settingRepository.findById(Constants.GLOBAL_SUBSCRIPTION_OVERRIDE)
+                .map(Setting::getValue)
+                .orElse("");
+        if (StringUtils.isNotBlank(json)) {
+            overrideConfig(config, json);
+        }
     }
 }

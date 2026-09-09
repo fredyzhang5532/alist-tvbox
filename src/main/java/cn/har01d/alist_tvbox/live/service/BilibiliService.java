@@ -3,8 +3,10 @@ package cn.har01d.alist_tvbox.live.service;
 import cn.har01d.alist_tvbox.config.AppProperties;
 import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
+import cn.har01d.alist_tvbox.live.danmaku.BilibiliDanmakuClient;
 import cn.har01d.alist_tvbox.live.model.BilibiliCategoriesResponse;
 import cn.har01d.alist_tvbox.live.model.BilibiliCategory;
+import cn.har01d.alist_tvbox.live.model.BilibiliRoomInfo;
 import cn.har01d.alist_tvbox.live.model.BilibiliRoomPlayInfo;
 import cn.har01d.alist_tvbox.live.model.BilibiliRoomPlayResponse;
 import cn.har01d.alist_tvbox.live.model.BilibiliRoomResponse;
@@ -14,10 +16,11 @@ import cn.har01d.alist_tvbox.tvbox.CategoryList;
 import cn.har01d.alist_tvbox.tvbox.MovieDetail;
 import cn.har01d.alist_tvbox.tvbox.MovieList;
 import cn.har01d.alist_tvbox.util.Utils;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -43,6 +46,8 @@ import static cn.har01d.alist_tvbox.util.Constants.FOLDER;
 @Slf4j
 @Service
 public class BilibiliService implements LivePlatform {
+    /** 推荐流正常至少返回 10+ 条,低于该阈值视为源质量不足,继续尝试兜底链。 */
+    private static final int MIN_RECOMMEND_ROOMS = 10;
     private final Map<String, String> userMap = new HashMap<>();
     private final Map<String, List<BilibiliCategory>> categoryMap = new HashMap<>();
     private final RestTemplate restTemplate;
@@ -74,10 +79,9 @@ public class BilibiliService implements LivePlatform {
     public MovieList home() throws IOException {
         MovieList result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
+        List<BilibiliRoomInfo> rooms = recommendRooms();
 
-        String url = "https://api.live.bilibili.com/xlive/web-interface/v1/second/getListByArea?sort=online&platform=web&page=1&page_size=30";
-        var response = restTemplate.getForObject(url, BilibiliRoomsResponse.class);
-        for (var room : response.getData().getList()) {
+        for (var room : rooms) {
             MovieDetail detail = new MovieDetail();
             detail.setVod_id(getType() + "$" + room.getRoomid());
             detail.setVod_name(room.getTitle());
@@ -88,11 +92,105 @@ public class BilibiliService implements LivePlatform {
         }
 
         result.setList(list);
-        result.setTotal(list.size());
-        result.setLimit(list.size());
+        result.setTotal(result.getList().size());
+        result.setLimit(result.getList().size());
 
         log.debug("home result: {}", result);
         return result;
+    }
+
+    /**
+     * 热门推荐三级链路(pure_live 验证的同款顺序):
+     * ① webMain/getMoreRecList 官方 web 首页推荐流,免 WBI 签名,重试 2 次(间隔 180ms);
+     * ② room/v1/Area/getListByAreaID 匿名分区接口兜底;
+     * ③ 原 index/getList 首页流最终保底。
+     * 登录态 cookie 下主源只返回少量个性化推荐:与匿名兜底结果合并(个性化排前、按房间号去重),
+     * 而不是二选一丢弃。
+     */
+    private List<BilibiliRoomInfo> recommendRooms() {
+        List<BilibiliRoomInfo> merged = new ArrayList<>(moreRecRooms());
+        if (merged.size() >= MIN_RECOMMEND_ROOMS) {
+            return merged;
+        }
+        for (BilibiliRoomInfo room : areaRooms()) {
+            if (merged.stream().noneMatch(item -> item.getRoomid() == room.getRoomid())) {
+                merged.add(room);
+            }
+        }
+        if (merged.size() < MIN_RECOMMEND_ROOMS) {
+            for (BilibiliRoomInfo room : indexRooms()) {
+                if (merged.stream().noneMatch(item -> item.getRoomid() == room.getRoomid())) {
+                    merged.add(room);
+                }
+            }
+        }
+        return merged;
+    }
+
+    private List<BilibiliRoomInfo> moreRecRooms() {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (attempt > 0) {
+                    Thread.sleep(180);
+                }
+                String url = "https://api.live.bilibili.com/xlive/web-interface/v1/webMain/getMoreRecList?platform=web&page=1";
+                var response = restTemplate.exchange(url, HttpMethod.GET, buildHttpEntity(null), BilibiliRoomsResponse.class).getBody();
+                if (response != null && response.getCode() == 0 && response.getData() != null
+                        && response.getData().getRecommend_room_list() != null) {
+                    return response.getData().getRecommend_room_list();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                log.debug("getMoreRecList attempt {} failed", attempt, e);
+            }
+        }
+        return List.of();
+    }
+
+    private List<BilibiliRoomInfo> areaRooms() {
+        try {
+            String url = "https://api.live.bilibili.com/room/v1/Area/getListByAreaID?areaId=0&parent_area_id=0&sort=online&pageSize=30&page=1";
+            ObjectNode response = restTemplate.exchange(url, HttpMethod.GET, buildHttpEntity(null), ObjectNode.class).getBody();
+            if (response != null && response.path("code").asInt(-1) == 0 && response.path("data").isArray()) {
+                List<BilibiliRoomInfo> rooms = new ArrayList<>();
+                for (JsonNode item : response.path("data")) {
+                    BilibiliRoomInfo room = new BilibiliRoomInfo();
+                    room.setRoomid(item.path("roomid").asInt());
+                    room.setTitle(item.path("title").asText());
+                    room.setCover(item.path("user_cover").asText(item.path("cover").asText()));
+                    room.setUname(item.path("uname").asText());
+                    if (room.getRoomid() > 0) {
+                        rooms.add(room);
+                    }
+                }
+                return rooms;
+            }
+        } catch (Exception e) {
+            log.debug("getListByAreaID failed", e);
+        }
+        return List.of();
+    }
+
+    /** 原 index/getList 首页推荐流(需 buvid3+Referer),作为最终保底。 */
+    private List<BilibiliRoomInfo> indexRooms() {
+        List<BilibiliRoomInfo> rooms = new ArrayList<>();
+        String url = "https://api.live.bilibili.com/xlive/web-interface/v1/index/getList?platform=web&page=1";
+        var response = restTemplate.exchange(url, HttpMethod.GET, buildHttpEntity(null), BilibiliRoomsResponse.class).getBody();
+        if (response != null && response.getCode() == 0 && response.getData() != null) {
+            if (response.getData().getRecommend_room_list() != null) {
+                rooms.addAll(response.getData().getRecommend_room_list());
+            }
+            if (response.getData().getRoom_list() != null) {
+                for (var room : response.getData().getRoom_list()) {
+                    if (rooms.stream().noneMatch(item -> item.getRoomid() == room.getRoomid())) {
+                        rooms.add(room);
+                    }
+                }
+            }
+        }
+        return rooms;
     }
 
     @Override
@@ -280,13 +378,22 @@ public class BilibiliService implements LivePlatform {
         String[] parts = tid.split("\\$");
         String id = parts[1];
         MovieList result = new MovieList();
+        // 关注刷新会对这两个接口产生持续请求,带上 buvid3/Referer(与 home 一致),避免裸请求被游客风控(-352)
         String url = "https://api.live.bilibili.com/room/v1/Room/get_info?room_id=" + id;
-        var response = restTemplate.getForObject(url, BilibiliRoomResponse.class);
-        var room = response.getData();
+        var response = restTemplate.exchange(url, HttpMethod.GET, buildHttpEntity(null), BilibiliRoomResponse.class).getBody();
         MovieDetail detail = new MovieDetail();
         detail.setVod_id(tid);
+        if (response == null || response.getCode() != 0 || response.getData() == null) {
+            log.warn("B站房间信息获取失败: {} code={}", id, response == null ? "null" : response.getCode());
+            result.getList().add(detail);
+            result.setTotal(1);
+            result.setLimit(1);
+            return result;
+        }
+        var room = response.getData();
         detail.setVod_name(room.getTitle());
-        detail.setVod_pic(fixCover(room.getCover()));
+        String cover = room.getUser_cover();
+        detail.setVod_pic(fixCover(cover == null || cover.isBlank() ? room.getCover() : cover));
         detail.setVod_actor(userMap.get(id));
         detail.setType_name(room.getArea_name());
         detail.setVod_remarks(playCount(room.getOnline()));
@@ -305,7 +412,12 @@ public class BilibiliService implements LivePlatform {
         List<String> playUrl = new ArrayList<>();
 
         String url = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?protocol=0,1&format=0,1,2&codec=0,1&platform=web&room_id=" + id;
-        var response = restTemplate.getForObject(url, BilibiliRoomPlayResponse.class);
+        var response = restTemplate.exchange(url, HttpMethod.GET, buildHttpEntity(null), BilibiliRoomPlayResponse.class).getBody();
+
+        // 房间未开播时接口不返回 playurl_info,无流可播;返回后 vod_play_url 为空即"未开播"标记
+        if (response == null || response.getData() == null || response.getData().getPlayurl_info() == null) {
+            return;
+        }
 
         int count = 1;
         var streams = response.getData().getPlayurl_info().getPlayurl().getStream();
@@ -343,6 +455,46 @@ public class BilibiliService implements LivePlatform {
             return response.get("data").get("room_info").get("room_id").asText();
         }
         return roomId;
+    }
+
+    private static final Pattern BUVID = Pattern.compile("buvid3=([^;]+)");
+    private static final Pattern DEDE_USER_ID = Pattern.compile("DedeUserID=(\\d+)");
+
+    /**
+     * 获取 B站弹幕连接参数:真实房间号 + getDanmuInfo(WBI 签名)返回的 token 与弹幕服务器。
+     */
+    public BilibiliDanmakuClient.BiliDanmakuArgs getDanmakuArgs(String roomId) {
+        try {
+            String realRoomId = getRealRoomId(roomId);
+            getKeys();
+            Map<String, Object> params = new HashMap<>();
+            params.put("id", realRoomId);
+            String url = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?" + Utils.encryptWbi(params, imgKey, subKey);
+            var response = restTemplate.exchange(url, HttpMethod.GET, buildHttpEntity(null), ObjectNode.class);
+            var data = response.getBody().path("data");
+            String token = data.path("token").asText("");
+            String host = data.path("host_list").path(0).path("host").asText("");
+            if (token.isEmpty() || host.isEmpty()) {
+                log.warn("B站弹幕参数获取失败: code={} {}", response.getBody().path("code").asInt(), roomId);
+                return null;
+            }
+            String cookie = settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse("");
+            Matcher matcher = BUVID.matcher(cookie);
+            String buvid = matcher.find() ? matcher.group(1) : "";
+            // 进房包的 uid 必须与 Cookie 的登录身份一致,否则服务端在握手后立刻断开
+            Matcher uidMatcher = DEDE_USER_ID.matcher(cookie);
+            long uid = 0;
+            if (uidMatcher.find()) {
+                try {
+                    uid = Long.parseLong(uidMatcher.group(1));
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            return new BilibiliDanmakuClient.BiliDanmakuArgs(Long.parseLong(realRoomId), uid, token, buvid, host, cookie);
+        } catch (Exception e) {
+            log.warn("B站弹幕参数获取失败: {}", roomId, e);
+            return null;
+        }
     }
 
     private String fixCover(String url) {

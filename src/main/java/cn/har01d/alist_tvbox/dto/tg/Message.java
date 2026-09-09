@@ -12,6 +12,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -20,9 +21,14 @@ import java.util.regex.Pattern;
 public class Message {
     private static final Logger LOGGER = LoggerFactory.getLogger(Message.class);
     private static final Pattern LINK = Pattern.compile("(https?://\\S+)");
+    // Leading decorative noise Telegram channels prepend to titles: whitespace,
+    // middle dots (U+00B7/U+0387/U+30FB), invisible variation selectors, ZWJ and
+    // emoji/pictograph ranges. Backstop for prefixes we don't enumerate verbatim.
+    private static final Pattern LEADING_NOISE = Pattern.compile("^[\\s\\u00B7\\u0387\\u30FB\\uFE0F\\uFE0E\\u200D\\u2600-\\u27BF\\u1F300-\\u1FAFF]+");
     private int id;
     private String mid;
     private Instant time;
+    private Long size;
     @JsonIgnore
     private String content;
     private String channel;
@@ -30,8 +36,12 @@ public class Message {
     private String type;
     private String link;
     private String cover;
+    private List<String> images = List.of();
+    private Map<String, Object> media;
     private String validityState;
     private String validitySummary;
+    /** 来源类别:站点源(wanou/panlian/guanying/woniu)标出自身,TG 三路留空。站点源标题结构化程度更高,打分加权。 */
+    private String sourceKind;
 
     public Message() {
     }
@@ -75,7 +85,8 @@ public class Message {
         this.content = message.getContent();
         this.link = link.getUrl();
         this.type = parseType(link.getUrl());
-        this.name = message.getTitle();
+        Object title = message.getTitle();
+        this.name = title == null || String.valueOf(title).isBlank() ? parseName() : cleanName(String.valueOf(title));
         this.channel = message.getChannel();
     }
 
@@ -84,8 +95,22 @@ public class Message {
         this.content = link.getNote();
         this.link = link.getUrl();
         this.type = type;
-        this.name = link.getNote();
+        this.name = parseName();
         this.channel = link.getSource();
+    }
+
+    public Message(String type, String url, Long size, String note, Instant datetime, List<String> images, Map<String, Object> media) {
+        this.time = datetime == null ? Instant.now() : datetime;
+        this.content = note == null ? "" : note;
+        this.link = url;
+        this.type = type;
+        this.size = size;
+        this.images = images == null ? List.of() : images;
+        this.media = media;
+        this.cover = this.images.isEmpty() ? null : this.images.getFirst();
+        Object title = media == null ? null : media.get("title");
+        this.name = title == null || String.valueOf(title).isBlank() ? parseName() : cleanName(String.valueOf(title));
+        this.channel = "tg-search";
     }
 
     public String toPgString() {
@@ -105,7 +130,23 @@ public class Message {
         if (line.startsWith("https://") && lines.length > 1) {
             line = lines[1];
         }
-        String name = line.replace("名称：", "").replace("名称:", "").replace("资源标题：", "");
+        return cleanName(line);
+    }
+
+    // Unified title cleaning for both the scraped-content path (parseName) and the
+    // tg-search media.title path. Telegram emoji often carry U+FE0F variation
+    // selectors that defeat exact matches, so strip those first; then drop known
+    // labels/prefixes; then trim any remaining leading decorative run; then cut at
+    // description markers.
+    private String cleanName(String input) {
+        String name = input.replace("\uFE0F", "").replace("\uFE0E", "")
+                .replace("名称：", "")
+                .replace("名称:", "")
+                .replace("资源标题：", "")
+                .replace("\uD83C\uDFAC 电影：", "")
+                .replace("#剧集\uD83D\uDDC4 ", "")
+                .replace("\uD83D\uDCFA 电视剧：", "");
+        name = LEADING_NOISE.matcher(name).replaceFirst("");
         int index = name.indexOf("描述：");
         if (index > 0) {
             return name.substring(0, index);
@@ -160,14 +201,49 @@ public class Message {
         return links;
     }
 
+    private static final String TRAILING_GARBAGE = "，。；：；,.;:?！？、）》」』】)]}·…—–​‌‍﻿";
+
     private static String fixLink(String link) {
         if (link.endsWith("**")) {
             return link.substring(0, link.length() - 2);
         }
+        // Strip trailing punctuation, emoji and other garbage characters
+        int end = link.length();
+        while (end > 0) {
+            char ch = link.charAt(end - 1);
+            if (isTrailingGarbage(ch)) {
+                end--;
+            } else {
+                break;
+            }
+        }
+        if (end < link.length()) {
+            return link.substring(0, end);
+        }
         return link;
     }
 
-    private static String parseType(String link) {
+    private static boolean isTrailingGarbage(char ch) {
+        // Common punctuation and invisible characters
+        if (TRAILING_GARBAGE.indexOf(ch) >= 0) {
+            return true;
+        }
+        // CJK punctuation range
+        if (ch >= '　' && ch <= '〿') {
+            return true;
+        }
+        // Emoji ranges
+        if (ch >= 0x1F300 && ch <= 0x1FAFF) {
+            return true;
+        }
+        // Emoji modifier and variation selector
+        if (ch == 0xFE0F || ch == 0xFE0E || ch >= 0x1F3FB && ch <= 0x1F3FF) {
+            return true;
+        }
+        return false;
+    }
+
+    public static String parseType(String link) {
         if (link.startsWith("magnet:")) {
             return "magnet";
         }
@@ -183,13 +259,13 @@ public class Message {
         if (link.contains("xunlei.com")) {
             return "2";
         }
-        if (link.contains("123pan.com") || link.contains("123pan.cn") || link.contains("123684.com") || link.contains("123865.com") || link.contains("123912.com") || link.contains("123592.com")) {
+        if (link.contains("123pan.com") || link.contains("123pan.cn") || link.contains("123684.com") || link.contains("123685.com") || link.contains("123865.com") || link.contains("123912.com") || link.contains("123592.com")) {
             return "3";
         }
         if (link.contains("quark.cn")) {
             return "5";
         }
-        if (link.contains("139.com")) {
+        if (link.contains("139.com") || link.contains("caiyun.feixin.10086.cn")) {
             return "6";
         }
         if (link.contains("uc.cn")) {
@@ -200,6 +276,9 @@ public class Message {
         }
         if (link.contains("189.cn")) {
             return "9";
+        }
+        if (link.contains("guangyapan.com")) {
+            return "12";
         }
         if (link.contains("baidu.com")) {
             return "10";

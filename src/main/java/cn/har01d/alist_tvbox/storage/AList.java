@@ -1,15 +1,14 @@
 package cn.har01d.alist_tvbox.storage;
 
-import org.apache.commons.lang3.StringUtils;
-
 import cn.har01d.alist_tvbox.entity.Site;
+import org.apache.commons.lang3.StringUtils;
 
 public class AList extends Storage {
     public AList(Site site) {
         super(site);
         addAddition("root_folder_path", StringUtils.isBlank(site.getFolder()) ? "/" : site.getFolder());
         addAddition("url", site.getUrl());
-        if (site.getVersion() == 3) {
+        if (site.getStorageVersion() == null || site.getStorageVersion() == 3) {
             addAddition("meta_password", site.getPassword());
             addAddition("token", site.getToken());
         } else {

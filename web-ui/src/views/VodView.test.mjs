@@ -10,3 +10,20 @@ test('vod search type selector includes magnet and ed2k filters', () => {
   assert.equal(viewSource.includes(`{label: '磁力', value: 'magnet'}`), true)
   assert.equal(viewSource.includes(`{label: 'ED2K', value: 'ed2k'}`), true)
 })
+
+test('vod route id opens detail player instead of browsing folder', () => {
+  assert.equal(viewSource.includes(`const getRouteVodId = () => {`), true)
+  assert.equal(viewSource.includes(`const queryId = route.query.id`), true)
+  assert.equal(viewSource.includes(`/^\\d+\\$[^$]+\\$\\d+$/.test(path[0])`), true)
+  assert.equal(viewSource.includes(`const routeVodId = getRouteVodId()`), true)
+  assert.equal(viewSource.includes(`loadDetail(routeVodId)`), true)
+  assert.equal(viewSource.includes(`if (store.token && !getRouteVodId()) {`), true)
+  assert.equal(viewSource.includes(`() => route.query.id`), true)
+})
+
+test('web playback writes and resumes the shared AList playback identity', () => {
+  assert.equal(viewSource.includes("axios.post('/api/playback/events'"), true)
+  assert.equal(viewSource.includes("sourceKey: 'csp_AList'"), true)
+  assert.equal(viewSource.includes("axios.get('/api/playback/records/-/item'"), true)
+  assert.equal(viewSource.includes("row.source_key === 'csp_AList'"), true)
+})

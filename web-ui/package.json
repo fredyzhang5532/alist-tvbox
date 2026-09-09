@@ -8,13 +8,15 @@
     "preview": "vite preview",
     "build-only": "vite build",
     "type-check": "vue-tsc --noEmit",
-    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore"
+    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore",
+    "test": "node --test src/utils/subscriptionConfig.test.mjs src/views/SubscriptionsView.test.mjs src/views/VodView.test.mjs"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
     "@types/sortablejs": "^1.15.9",
     "axios": "1.12.0",
-    "element-plus": "2.11.3",
+    "element-plus": "2.14.1",
+    "hls.js": "^1.7.0",
     "lodash-es": "^4.17.23",
     "mpegts.js": "^1.8.0",
     "sortablejs": "^1.15.6",

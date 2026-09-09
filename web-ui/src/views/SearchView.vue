@@ -1,13 +1,18 @@
 <template>
-  <div class="search">
-    <h2>API地址</h2>
-    <div class="description">
+  <div class="page-container">
+    <div class="page-header">
+      <h1 class="page-title">搜索</h1>
+    </div>
+
+    <div class="page-card">
+    <h3>API地址</h3>
+    <div style="margin-bottom: 16px;">
       <a :href="currentUrl+getPath(type)+'/'+store.token+'?wd=' + keyword"
          target="_blank">{{ currentUrl }}{{ getPath(type) }}/{{ store.token }}?wd={{ keyword }}</a>
     </div>
 
-    <div>
-      <el-input v-model="keyword" @change="search"/>
+    <div style="margin-bottom: 16px;">
+      <el-input v-model="keyword" @change="search" style="width: 300px; margin-right: 12px;"/>
       <el-button type="primary" @click="search" :disabled="!keyword || searching">搜索</el-button>
       <el-button type="primary" @click="showDialog" v-if="store.admin">设置</el-button>
     </div>
@@ -20,6 +25,7 @@
         <el-radio label="4" size="large">Emby</el-radio>
         <el-radio label="5" size="large">Jellyfin</el-radio>
         <el-radio label="7" size="large">飞牛影视</el-radio>
+        <el-radio label="8" size="large">电报频道</el-radio>
         <el-radio label="6" size="large">鱼佬盘搜</el-radio>
       </el-radio-group>
     </el-form-item>
@@ -46,10 +52,11 @@
       </el-button>
     </div>
 
-    <el-table v-if="(type==''||type=='1')&&config" :data="config.list" border style="width: 100%">
+    <div class="table-scroll-wrapper">
+      <el-table v-if="(type==''||type=='1')&&config" :data="config.list" border style="width: 100%; min-width: 800px">
       <el-table-column prop="vod_name" label="名称" width="300">
         <template #default="scope">
-          <a :href="'/#/vod'+scope.row.vod_content" target="_blank">
+          <a :href="getSearchResultHref(scope.row)" target="_blank">
             {{ scope.row.vod_name }}
           </a>
         </template>
@@ -64,8 +71,10 @@
       <el-table-column prop="vod_year" label="年份" width="90"/>
       <el-table-column prop="vod_remarks" label="评分" width="100"/>
     </el-table>
+    </div>
 
-    <el-table v-if="(type=='6')&&config" :data="filteredPanSouResults" border style="width: 100%" v-loading="searching">
+    <div class="table-scroll-wrapper">
+      <el-table v-if="(type=='6'||type=='8')&&config" :data="filteredPanSouResults" border style="width: 100%; min-width: 800px" v-loading="searching">
       <el-table-column prop="vod_name" label="名称" sortable>
         <template #default="scope">
           <a :href="'/#/vod?link='+scope.row.vod_id" target="_blank">
@@ -90,17 +99,21 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="90">
+      <el-table-column label="操作" width="140">
         <template #default="scope">
           <el-button link type="primary" :disabled="!isCheckSupportedRow(scope.row)" :loading="scope.row.validity_checking" @click="checkLink(scope.row)">
             检测
           </el-button>
+          <el-button link type="success" @click="followSearch(scope.row)">
+            追更
+          </el-button>
         </template>
       </el-table-column>
     </el-table>
+    </div>
 
-    <h2 v-if="type!='6'">API返回数据</h2>
-    <div class="data" v-if="type!='6'">
+    <h2 v-if="type!='6'&&type!='8'">API返回数据</h2>
+    <div class="data" v-if="type!='6'&&type!='8'">
       <json-viewer :value="config" expanded copyable show-double-quotes :show-array-index="false" :expand-depth=3>
       </json-viewer>
     </div>
@@ -126,6 +139,7 @@
       </template>
     </el-dialog>
 
+    </div>
   </div>
 </template>
 
@@ -164,9 +178,18 @@ const getPath = (type: string) => {
     return '/feiniu'
   } else if (type == '6') {
     return '/pansou'
+  } else if (type == '8') {
+    return '/tgsc'
   } else {
     return '/vod'
   }
+}
+
+const getSearchResultHref = (row: any) => {
+  if (type.value == '') {
+    return '/#/vod?id=' + encodeURIComponent(row.vod_id)
+  }
+  return '/#/vod' + row.vod_content
 }
 
 const diskTypeMap: Record<string, string> = {
@@ -215,6 +238,26 @@ const getValidityTagType = (state: string) => {
 
 const isCheckSupportedRow = (row: any) => {
   return !!diskTypeMap[row.vod_remarks]
+}
+
+const followingKeys = new Set<string>()
+
+const followSearch = (row: any) => {
+  const link = decodeURIComponent(row.vod_id || '')
+  if (!link.startsWith('http')) {
+    ElMessage.warning('该结果不是网盘分享链接,请在追剧页手动订阅')
+    return
+  }
+  const key = row.vod_name + '|' + link
+  if (followingKeys.has(key)) {
+    return // 提交中防连点;后端 create 同名同季幂等兜底
+  }
+  followingKeys.add(key)
+  axios.post('/api/media-subscriptions/follow', {name: row.vod_name, link: link}).then(() => {
+    ElMessage.success(`已订阅追更「${row.vod_name}」,当前资源直接作为主源,稍后到追剧页查看`)
+  }).finally(() => {
+    followingKeys.delete(key)
+  })
 }
 
 const formatDisplayLink = (vodId: string) => {

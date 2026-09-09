@@ -1,30 +1,208 @@
 <template>
-  <div class="files">
-    <h1>文件列表</h1>
-    <el-row justify="end">
-      <el-button @click="load">刷新</el-button>
-      <el-button type="primary" @click="handleAdd">添加</el-button>
-    </el-row>
-    <div class="space"></div>
+  <div class="page-container">
+    <div class="page-header">
+      <h1 class="page-title">文件管理</h1>
+    </div>
 
-    <el-table :data="files" border style="width: 100%">
-<!--      <el-table-column prop="id" label="ID" width="70"/>-->
-      <el-table-column prop="dir" label="文件目录" width="250"/>
-      <el-table-column prop="name" label="文件名称" width="180"/>
-      <el-table-column prop="path" label="完整路径"/>
-      <el-table-column prop="link" label="链接">
-        <template #default="scope">
-          <a :href="currentUrl+scope.row.path.substring(4)" target="_blank" v-if="scope.row.path.startsWith('/www/')">{{currentUrl + scope.row.path.substring(4)}}</a>
-        </template>
-      </el-table-column>
-      <el-table-column fixed="right" label="操作" width="200">
-        <template #default="scope">
-          <el-button type="primary" size="small" @click="handleEdit(scope.row)">编辑</el-button>
-          <el-button type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+    <div class="page-card">
+    <el-tabs v-model="activeTab">
+      <el-tab-pane label="配置文件" name="config">
+        <el-row justify="end">
+          <el-button @click="loadConfig">刷新</el-button>
+          <el-button type="primary" @click="handleAdd">添加</el-button>
+        </el-row>
+        <div class="space"></div>
+        <div class="table-scroll-wrapper">
 
+        <el-table :data="files" border style="width: 100%; min-width: 900px">
+          <el-table-column prop="dir" label="文件目录" width="250"/>
+          <el-table-column prop="name" label="文件名称" width="180"/>
+          <el-table-column prop="path" label="完整路径"/>
+          <el-table-column prop="link" label="链接">
+            <template #default="scope">
+              <a :href="currentUrl+scope.row.path.substring(4)" target="_blank"
+                 v-if="scope.row.path.startsWith('/www/')">{{currentUrl + scope.row.path.substring(4)}}</a>
+            </template>
+          </el-table-column>
+          <el-table-column fixed="right" label="操作" width="200">
+            <template #default="scope">
+              <el-button link type="primary" size="small" @click="handleEdit(scope.row)">编辑</el-button>
+              <el-button link type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="静态文件" name="static">
+        <el-row justify="space-between" align="middle">
+          <el-breadcrumb separator="/">
+            <el-breadcrumb-item @click="navigateTo('')">
+              <el-link type="primary">/根目录</el-link>
+            </el-breadcrumb-item>
+            <el-breadcrumb-item v-for="(seg, idx) in pathSegments" :key="idx"
+                                @click="navigateTo(pathSegments.slice(0, idx + 1).join('/'))">
+              <el-link type="primary">{{ seg }}</el-link>
+            </el-breadcrumb-item>
+          </el-breadcrumb>
+          <div>
+            <template v-if="selectedPaths.length > 0">
+              <el-button type="success" @click="batchDownloadSelected">
+                下载 ({{ selectedPaths.length }})
+              </el-button>
+              <el-button type="danger" @click="batchDeleteSelected">
+                删除 ({{ selectedPaths.length }})
+              </el-button>
+              <el-button type="warning" @click="showMoveDialog">
+                移动 ({{ selectedPaths.length }})
+              </el-button>
+            </template>
+            <template v-else>
+              <el-button @click="loadStatic">刷新</el-button>
+              <el-button type="success" @click="showUploadDialog">上传文件</el-button>
+              <el-button type="primary" @click="showMkdirDialog">新建文件夹</el-button>
+              <el-button type="warning" @click="scanPlugins">扫描插件目录</el-button>
+            </template>
+          </div>
+        </el-row>
+        <div class="space"></div>
+
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px">
+          <template #title>
+            <p>
+              <span>将壁纸图片上传到 <strong>wallpapers</strong> 文件夹，可通过 API 随机获取壁纸：</span><br>
+              <a :href="currentUrl+'/wallpaper'+token" target="_blank">{{ currentUrl }}/wallpaper{{ token }}</a><br>
+              订阅定制，壁纸地址填写：
+              <code>WALLPAPER_API</code><br>
+            </p>
+          </template>
+        </el-alert>
+
+        <el-alert type="success" :closable="false" show-icon style="margin-bottom: 10px">
+          <template #title>
+            <p>
+              将 <code>.py</code> 爬虫脚本上传到 <strong>plugins</strong> 文件夹，会自动同步到<strong>订阅源管理</strong>：
+              上传/重传即注册或更新，删除文件即移除（也可
+              <a href="javascript:void(0)" style="color: var(--el-color-success)" @click="scanPlugins">手动扫描</a>）。
+            </p>
+          </template>
+        </el-alert>
+
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px">
+          <template #title>
+            <p>
+              将自定义首页 HTML 命名为 <code>app.html</code> 上传到 <strong>webhome</strong> 文件夹，可替换 TV 客户端
+              <strong>「影视首页」</strong>（WebHome）的内置页面（zip 解压上传可附带 css/js/图片等相对资源）；删除该文件即恢复内置页面。
+            </p>
+          </template>
+        </el-alert>
+
+        <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 10px">
+          <template #title>
+            <p>
+              将 <code>.html</code> 网页上传到 <strong>webhome/pages</strong> 文件夹，会自动注册为<strong>订阅源</strong>（可添加多个自定义网页站点）：
+              上传/重传即注册或更新，删除文件即移除，可在<strong>订阅源管理</strong>中改名/调序/禁用（zip 解压上传可附带 css/js/图片等相对资源）。
+            </p>
+          </template>
+        </el-alert>
+
+        <el-table ref="staticTableRef" :data="staticFiles" border style="width: 100%" v-loading="staticLoading"
+                  @row-dblclick="handleRowDblClick" @selection-change="handleSelectionChange">
+          <el-table-column type="selection" width="45"/>
+          <el-table-column prop="name" label="文件名" min-width="250">
+            <template #default="scope">
+              <el-icon v-if="scope.row.directory" style="vertical-align: middle; margin-right: 4px">
+                <Folder/>
+              </el-icon>
+              <el-icon v-else style="vertical-align: middle; margin-right: 4px">
+                <Document/>
+              </el-icon>
+              <span style="cursor: pointer" @click="handleFileNameClick(scope.row)">{{ scope.row.name }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="大小" width="120">
+            <template #default="scope">
+              {{ scope.row.directory ? '-' : formatSize(scope.row.size) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="修改时间" width="185">
+            <template #default="scope">
+              {{ formatDate(scope.row.lastModified) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="外部链接" min-width="200">
+            <template #default="scope">
+              <a v-if="!scope.row.directory" :href="currentUrl + scope.row.url" target="_blank"
+                 class="static-link">{{ currentUrl + scope.row.url }}</a>
+            </template>
+          </el-table-column>
+          <el-table-column fixed="right" label="操作" width="230">
+            <template #default="scope">
+              <el-button link type="primary" size="small" @click="showRenameDialog(scope.row)">重命名</el-button>
+              <el-button link type="success" size="small" @click="downloadFile(scope.row)">下载</el-button>
+              <el-button link type="danger" size="small" @click="handleStaticDelete(scope.row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="猫源文件" name="cat">
+        <el-row justify="space-between" align="middle">
+          <div style="word-break: break-all">
+            猫影视node配置接口：
+            <a :href="catNodeUrl" target="_blank">{{ catNodeUrl }}</a>
+            <el-button size="small" style="margin-left: 4px" @click="copyText(catNodeUrl)">复制</el-button>
+          </div>
+          <div>
+            <el-button @click="loadCatFiles">刷新</el-button>
+            <el-button type="success" @click="catUploadVisible = true">上传猫源</el-button>
+          </div>
+        </el-row>
+        <div class="space"></div>
+
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 10px">
+          <template #title>
+            <p>
+              <strong>自定义爬虫</strong>：单个爬虫 <code>.js</code> 上传后自动注册（内置源不受影响），在猫影视 App 内刷新配置即可见；<br>
+              <strong>依赖库</strong>：爬虫的 <code>./lib/…</code> 依赖打 zip 上传（条目以 <code>custom/</code> 或 <code>lib/</code> 开头）。
+            </p>
+          </template>
+        </el-alert>
+
+        <el-table :data="catFiles?.files ?? []" border style="width: 100%" v-loading="catLoading">
+          <el-table-column label="文件" min-width="300">
+            <template #default="scope">
+              <el-tag v-if="scope.row.path.startsWith('custom/')"
+                      size="small" type="success" style="margin-right: 4px">爬虫</el-tag>
+              {{ displayCatPath(scope.row.path) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="大小" width="110">
+            <template #default="scope">{{ formatSize(scope.row.size) }}</template>
+          </el-table-column>
+          <el-table-column label="修改时间" width="185">
+            <template #default="scope">{{ formatDate(scope.row.lastModified) }}</template>
+          </el-table-column>
+          <el-table-column fixed="right" label="操作" width="170">
+            <template #default="scope">
+              <el-button link type="primary" size="small" @click="previewCatFile(scope.row)">预览</el-button>
+              <el-button link type="success" size="small" @click="downloadCatFile(scope.row)">下载</el-button>
+              <el-button link type="danger" size="small" @click="deleteCatFile(scope.row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+    </el-tabs>
+
+    <el-dialog v-model="catPreviewVisible" :title="'预览 - ' + catPreviewName" fullscreen>
+      <el-input :model-value="catPreviewContent" type="textarea" :rows="36" readonly
+                style="font-family: monospace; font-size: 12px"/>
+      <template #footer>
+        <el-button @click="catPreviewVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- Config file dialogs -->
     <el-dialog v-model="formVisible" :fullscreen="fullscreen" :title="dialogTitle">
       <el-form :model="form">
         <el-form-item label="目录" label-width="120" required>
@@ -62,7 +240,8 @@
       </div>
       <h2>JSON数据</h2>
       <el-scrollbar height="800px">
-        <json-viewer :value="jsonData" expanded copyable show-double-quotes :show-array-index="false" :expand-depth=5></json-viewer>
+        <json-viewer :value="jsonData" expanded copyable show-double-quotes :show-array-index="false"
+                     :expand-depth=5></json-viewer>
       </el-scrollbar>
       <div class="json"></div>
       <template #footer>
@@ -82,14 +261,135 @@
       </span>
       </template>
     </el-dialog>
+
+    <!-- Static file dialogs -->
+    <el-dialog v-model="uploadDialogVisible" title="上传文件" width="500px">
+      <el-upload
+        ref="uploadRef"
+        :action="uploadUrl"
+        :headers="uploadHeaders"
+        :data="uploadData"
+        :on-success="handleUploadSuccess"
+        :on-error="handleUploadError"
+        :before-upload="beforeUpload"
+        multiple
+        drag
+      >
+        <el-icon style="font-size: 40px; color: #909399"><Upload/></el-icon>
+        <div>拖拽文件到此处或 <em>点击上传</em></div>
+      </el-upload>
+      <div style="margin-top: 10px">
+        <el-checkbox v-model="autoExtract" label="自动解压 ZIP 文件"/>
+      </div>
+      <template #footer>
+        <el-button @click="uploadDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="catUploadVisible" title="上传猫源" width="500px">
+      <el-upload
+        ref="catUploadRef"
+        :action="catUploadUrl"
+        :headers="uploadHeaders"
+        :data="catUploadData"
+        :on-success="handleCatUploadSuccess"
+        :on-error="handleCatUploadError"
+        multiple
+        drag
+      >
+        <el-icon style="font-size: 40px; color: #909399"><Upload/></el-icon>
+        <div>拖拽猫源文件或本地包 zip 到此处，或 <em>点击上传</em></div>
+      </el-upload>
+      <div style="margin-top: 10px">
+        <el-checkbox v-model="catAutoExtract" label="自动解压 ZIP 文件（依赖库 zip 必须勾选）"/>
+        <div style="margin-top: 8px">
+          <el-input v-model="catSpiderName" placeholder="自定义爬虫显示名（可选，上传单个 .js 爬虫时生效）"
+                    style="width: 100%" clearable/>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="catUploadVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="mkdirDialogVisible" title="新建文件夹" width="400px">
+      <el-form @submit.prevent="confirmMkdir">
+        <el-form-item label="文件夹名称">
+          <el-input v-model="mkdirName" placeholder="请输入文件夹名称" autofocus/>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="mkdirDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmMkdir">确定</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="renameDialogVisible" title="重命名" width="400px">
+      <el-form @submit.prevent="confirmRename">
+        <el-form-item label="新名称">
+          <el-input v-model="renameNewName" placeholder="请输入新名称" autofocus/>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="renameDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmRename">确定</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="deleteDialogVisible" title="确认删除" width="400px">
+      <p v-if="deleteTargets.length === 1">
+        确定要删除 <strong>{{ deleteTargets[0]?.name }}</strong> 吗？
+      </p>
+      <p v-else>
+        确定要删除选中的 <strong>{{ deleteTargets.length }}</strong> 个项目吗？
+      </p>
+      <p v-if="deleteTargets.some((t: any) => t.directory)" style="color: #f56c6c">
+        包含文件夹，将删除文件夹及所有子文件！
+      </p>
+      <template #footer>
+        <el-button @click="deleteDialogVisible = false">取消</el-button>
+        <el-button type="danger" @click="confirmDelete">删除</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="moveDialogVisible" title="移动到" width="500px">
+      <p>已选择 <strong>{{ selectedPaths.length }}</strong> 个项目</p>
+      <div class="space"></div>
+      <el-tree
+        :data="dirTree"
+        :props="{ label: 'name', children: 'children' }"
+        node-key="path"
+        highlight-current
+        default-expand-all
+        @node-click="handleMoveTargetClick"
+      />
+      <div class="space"></div>
+      <p v-if="moveTargetDir !== null">
+        目标目录：<strong>/{{ moveTargetDir || '(根目录)' }}</strong>
+      </p>
+      <template #footer>
+        <el-button @click="moveDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmMove" :disabled="moveTargetDir === null">确定移动</el-button>
+      </template>
+    </el-dialog>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import {onMounted, ref} from 'vue'
+import {computed, onMounted, ref} from 'vue'
 import axios from "axios"
+import clipBorad from "vue-clipboard3"
+import {Folder, Document, Upload} from '@element-plus/icons-vue'
+import {ElMessage, ElMessageBox} from 'element-plus'
+import type {UploadInstance} from 'element-plus'
 
 const currentUrl = window.location.origin
+const {toClipboard} = clipBorad()
+
+const activeTab = ref('config')
+
+// ========== Config files ==========
 const updateAction = ref(false)
 const dialogTitle = ref('')
 const jsonData = ref({})
@@ -137,7 +437,7 @@ const handleDelete = (data: any) => {
 const deleteSub = () => {
   dialogVisible.value = false
   axios.delete('/api/files/' + form.value.id).then(() => {
-    load()
+    loadConfig()
   })
 }
 
@@ -149,18 +449,405 @@ const handleConfirm = () => {
   const url = updateAction.value ? '/api/files/' + form.value.id : '/api/files'
   axios.post(url, form.value).then(() => {
     formVisible.value = false
-    load()
+    loadConfig()
   })
 }
 
-const load = () => {
+const loadConfig = () => {
   axios.get('/api/files').then(({data}) => {
     files.value = data
   })
 }
 
+// ========== Static files ==========
+const staticFiles = ref<any[]>([])
+const staticLoading = ref(false)
+const currentStaticDir = ref('')
+const uploadDialogVisible = ref(false)
+const mkdirDialogVisible = ref(false)
+const mkdirName = ref('')
+const renameDialogVisible = ref(false)
+const renameNewName = ref('')
+const renameTarget = ref<any>(null)
+const deleteDialogVisible = ref(false)
+const deleteTargets = ref<any[]>([])
+const moveDialogVisible = ref(false)
+const moveTargetDir = ref<string | null>(null)
+const dirTree = ref<any[]>([])
+const selectedPaths = ref<string[]>([])
+const selectedRows = ref<any[]>([])
+const uploadRef = ref<UploadInstance>()
+const staticTableRef = ref()
+const token = ref('')
+
+const pathSegments = computed(() => {
+  if (!currentStaticDir.value) return []
+  return currentStaticDir.value.split('/').filter(Boolean)
+})
+
+const uploadUrl = '/api/static-files/upload'
+
+const autoExtract = ref(false)
+
+const uploadData = computed(() => ({
+  dir: currentStaticDir.value,
+  extract: autoExtract.value
+}))
+
+const uploadHeaders = computed(() => {
+  const token = localStorage.getItem('token')
+  return token ? {'Authorization': token} : {}
+})
+
+const beforeUpload = () => {
+  // Refresh data params before each upload
+  return true
+}
+
+const navigateTo = (dir: string) => {
+  currentStaticDir.value = dir
+  loadStatic()
+}
+
+const loadStatic = () => {
+  staticLoading.value = true
+  selectedPaths.value = []
+  selectedRows.value = []
+  axios.get('/api/static-files', {params: {dir: currentStaticDir.value}}).then(({data}) => {
+    staticFiles.value = data
+  }).finally(() => {
+    staticLoading.value = false
+  })
+}
+
+const handleRowDblClick = (row: any) => {
+  if (row.directory) {
+    currentStaticDir.value = row.path
+    loadStatic()
+  }
+}
+
+const handleFileNameClick = (row: any) => {
+  if (row.directory) {
+    handleRowDblClick(row)
+  } else {
+    copyFileUrl(row)
+  }
+}
+
+const copyFileUrl = (row: any) => {
+  const url = currentUrl + encodeURI(row.url)
+  toClipboard(url).then(() => {
+    ElMessage.success('已复制到剪贴板')
+  }).catch(() => {
+    ElMessage.error('复制失败')
+  })
+}
+
+const handleSelectionChange = (rows: any[]) => {
+  selectedRows.value = rows
+  selectedPaths.value = rows.map(r => r.path)
+}
+
+const showUploadDialog = () => {
+  uploadDialogVisible.value = true
+}
+
+const handleUploadSuccess = () => {
+  ElMessage.success('上传成功')
+  const dir = currentStaticDir.value || ''
+  if (dir === 'plugins' || dir.startsWith('plugins/')) {
+    ElMessage.info('已同步到订阅源管理')
+  }
+  uploadDialogVisible.value = false
+  uploadRef.value?.clearFiles()
+  loadStatic()
+}
+
+const handleUploadError = () => {
+  ElMessage.error('上传失败')
+}
+
+const scanPlugins = () => {
+  axios.post('/api/plugins/scan').then(() => {
+    ElMessage.success('已扫描 plugins 目录并同步订阅源')
+  }).catch(() => {
+    ElMessage.error('扫描失败')
+  })
+}
+
+const showMkdirDialog = () => {
+  mkdirName.value = ''
+  mkdirDialogVisible.value = true
+}
+
+const confirmMkdir = () => {
+  if (!mkdirName.value.trim()) {
+    ElMessage.warning('请输入文件夹名称')
+    return
+  }
+  const path = currentStaticDir.value ? currentStaticDir.value + '/' + mkdirName.value : mkdirName.value
+  axios.post('/api/static-files/mkdir', null, {params: {path}}).then(() => {
+    ElMessage.success('创建成功')
+    mkdirDialogVisible.value = false
+    loadStatic()
+  }).catch(() => {
+    ElMessage.error('创建失败')
+  })
+}
+
+const showRenameDialog = (row: any) => {
+  renameTarget.value = row
+  renameNewName.value = row.name
+  renameDialogVisible.value = true
+}
+
+const confirmRename = () => {
+  if (!renameNewName.value.trim()) {
+    ElMessage.warning('请输入新名称')
+    return
+  }
+  axios.post('/api/static-files/rename', null, {
+    params: {path: renameTarget.value.path, newName: renameNewName.value}
+  }).then(() => {
+    ElMessage.success('重命名成功')
+    renameDialogVisible.value = false
+    loadStatic()
+  }).catch(() => {
+    ElMessage.error('重命名失败')
+  })
+}
+
+const handleStaticDelete = (row: any) => {
+  deleteTargets.value = [row]
+  deleteDialogVisible.value = true
+}
+
+const batchDeleteSelected = () => {
+  deleteTargets.value = [...selectedRows.value]
+  deleteDialogVisible.value = true
+}
+
+const confirmDelete = () => {
+  const targets = deleteTargets.value
+  if (targets.length === 1) {
+    axios.delete('/api/static-files', {params: {path: targets[0].path}}).then(() => {
+      ElMessage.success('删除成功')
+      deleteDialogVisible.value = false
+      loadStatic()
+    }).catch(() => {
+      ElMessage.error('删除失败')
+    })
+  } else {
+    axios.delete('/api/static-files/batch', {data: {paths: targets.map(t => t.path)}}).then(({data}) => {
+      ElMessage.success(`已删除 ${data} 个项目`)
+      deleteDialogVisible.value = false
+      loadStatic()
+    }).catch(() => {
+      ElMessage.error('批量删除失败')
+    })
+  }
+}
+
+const downloadFile = (row: any) => {
+  window.open('/api/static-files/download?path=' + encodeURIComponent(row.path) + '&X-ACCESS-TOKEN=' + localStorage.getItem("token"), '_blank')
+}
+
+const batchDownloadSelected = () => {
+  axios.post('/api/static-files/batch-download', {paths: selectedPaths.value}, {responseType: 'blob'}).then(({data}) => {
+    const url = window.URL.createObjectURL(new Blob([data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', 'download.zip')
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.URL.revokeObjectURL(url)
+    ElMessage.success('下载完成')
+  }).catch(() => {
+    ElMessage.error('批量下载失败')
+  })
+}
+
+const showMoveDialog = () => {
+  moveTargetDir.value = null
+  dirTree.value = []
+  moveDialogVisible.value = true
+  loadDirTree()
+}
+
+const loadDirTree = () => {
+  axios.get('/api/static-files/dirs').then(({data}) => {
+    dirTree.value = data
+  })
+}
+
+const handleMoveTargetClick = (node: any) => {
+  moveTargetDir.value = node.path
+}
+
+const confirmMove = () => {
+  if (moveTargetDir.value === null) return
+  axios.post('/api/static-files/move', {
+    paths: selectedPaths.value,
+    targetDir: moveTargetDir.value
+  }).then(({data}) => {
+    ElMessage.success(`已移动 ${data} 个项目`)
+    moveDialogVisible.value = false
+    loadStatic()
+  }).catch(() => {
+    ElMessage.error('移动失败')
+  })
+}
+
+// ========== Cat custom spiders ==========
+interface CatFileEntry {
+  path: string
+  size: number
+  lastModified: number
+}
+
+interface CatUploadEntry {
+  path: string
+  overwritten: boolean
+}
+
+interface CatFilesResult {
+  files: CatFileEntry[]
+}
+
+const catFiles = ref<CatFilesResult | null>(null)
+const catLoading = ref(false)
+const catUploadVisible = ref(false)
+const catAutoExtract = ref(true)
+const catSpiderName = ref('')
+const catUploadRef = ref<UploadInstance>()
+const catUploadUrl = '/api/cat/upload'
+const catUploadData = computed<Record<string, any>>(() => {
+  const data: Record<string, any> = {autoExtract: catAutoExtract.value}
+  const name = catSpiderName.value.trim()
+  if (name) data.name = name
+  return data
+})
+
+const catNodeUrl = computed(() => {
+  const t = token.value ? token.value.substring(1) : '-'
+  // 猫影视客户端只接受 URL 内嵌 basic auth 的配置地址(同订阅页 nodeUrl 拼法)
+  return withBasicAuth(currentUrl) + '/node/' + t + '/index.config.js'
+})
+
+const basicAuthUser = ref('')
+const basicAuthPass = ref('')
+
+const withBasicAuth = (base: string) => {
+  if (!basicAuthUser.value && !basicAuthPass.value) return base
+  const prefix = basicAuthUser.value + ':' + basicAuthPass.value + '@'
+  return base.replace('http://', 'http://' + prefix).replace('https://', 'https://' + prefix)
+}
+
+const loadCatFiles = () => {
+  catLoading.value = true
+  axios.get<CatFilesResult>('/api/cat/files').then(({data}) => {
+    catFiles.value = data
+  }).finally(() => {
+    catLoading.value = false
+  })
+}
+
+const copyText = (text: string) => {
+  toClipboard(text).then(() => {
+    ElMessage.success('已复制到剪贴板')
+  }).catch(() => {
+    ElMessage.error('复制失败')
+  })
+}
+
+// 列表展示去掉 custom/ 层级(该 tab 即 custom 目录视角);删除操作仍传完整 path
+const displayCatPath = (path: string) => path.startsWith('custom/') ? path.substring('custom/'.length) : path
+
+const handleCatUploadSuccess = (result: CatUploadEntry[] | any) => {
+  catUploadVisible.value = false
+  catUploadRef.value?.clearFiles()
+  catSpiderName.value = ''
+  const entries: CatUploadEntry[] = result?.entries ?? []
+  if (entries.length > 0) {
+    if (entries.some((e) => e.overwritten)) {
+      ElMessage.info(`已覆盖 ${entries.filter((e) => e.overwritten).length} 个文件`)
+    }
+    if (entries.some((e) => e.path.startsWith('custom/'))) {
+      ElMessage.success('已注册自定义爬虫，在猫影视 App 内刷新配置即可见（内置源不受影响）')
+    }
+  }
+  loadCatFiles()
+}
+
+const handleCatUploadError = () => {
+  ElMessage.error('上传失败（单个爬虫 .js 或含 custom//lib/ 条目的 zip；zip 请勾选自动解压）')
+}
+
+const deleteCatFile = (row: CatFileEntry) => {
+  ElMessageBox.confirm(`确定删除 ${row.path} 吗？该文件将被彻底移除。`, '删除猫源文件', {type: 'warning'})
+      .then(() => axios.delete('/api/cat/file', {params: {path: row.path}}))
+      .then(() => {
+        ElMessage.success('已删除')
+        loadCatFiles()
+      })
+      .catch(() => {
+      })
+}
+
+const catPreviewVisible = ref(false)
+const catPreviewName = ref('')
+const catPreviewContent = ref('')
+
+const previewCatFile = (row: CatFileEntry) => {
+  if (row.size > 1024 * 1024) {
+    ElMessage.warning('文件超过 1MB，请下载后查看')
+    return
+  }
+  axios.get('/api/cat/download', {
+    params: {path: row.path},
+    responseType: 'text',
+    transformResponse: [(data: any) => data]
+  }).then(({data}) => {
+    catPreviewName.value = displayCatPath(row.path)
+    catPreviewContent.value = String(data)
+    catPreviewVisible.value = true
+  }).catch(() => {
+    ElMessage.error('预览失败')
+  })
+}
+
+const downloadCatFile = (row: CatFileEntry) => {
+  window.open('/api/cat/download?path=' + encodeURIComponent(row.path)
+      + '&X-ACCESS-TOKEN=' + localStorage.getItem('token'), '_blank')
+}
+
+const formatSize = (bytes: number) => {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i]
+}
+
+const formatDate = (timestamp: number) => {
+  if (!timestamp) return ''
+  return new Date(timestamp).toLocaleString()
+}
+
 onMounted(() => {
-  load()
+  axios.get('/api/token').then(({data}) => {
+    token.value = data.enabledToken ? "/" + data.token.split(",")[0] : ""
+  })
+  axios.get('/api/basic-auth-credentials').then(({data}) => {
+    basicAuthUser.value = data.username || ''
+    basicAuthPass.value = data.password || ''
+  }).catch(() => {
+  })
+  loadConfig()
+  loadStatic()
+  loadCatFiles()
 })
 </script>
 
@@ -172,5 +859,10 @@ onMounted(() => {
 .json pre {
   height: 600px;
   overflow: scroll;
+}
+
+.static-link {
+  word-break: break-all;
+  font-size: 12px;
 }
 </style>

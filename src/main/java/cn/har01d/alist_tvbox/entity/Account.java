@@ -1,11 +1,7 @@
 package cn.har01d.alist_tvbox.entity;
 
 
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
+import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -15,9 +11,12 @@ import java.time.Instant;
 
 @Getter
 @Setter
-@ToString
+@ToString(exclude = {"accessToken", "refreshToken"})
 @RequiredArgsConstructor
 @Entity
+@Table(indexes = {
+    @Index(name = "idx_account_nickname", columnList = "nickname")
+})
 public class Account {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -46,4 +45,10 @@ public class Account {
     private boolean useProxy;
     private Integer concurrency = 4;
     private Integer chunkSize = 256;
+    /** 归属用户:0=全局(管理员所有);>0=该用户的个人账号。凭证只下发给归属人。 */
+    @Column(name = "owner_uid")
+    private int ownerUid;
+    /** 仅全局账号有效:是否允许普通用户经服务端代理使用(凭证不下发)。 */
+    @Column(columnDefinition = "BOOLEAN DEFAULT TRUE")
+    private boolean shared = true;
 }

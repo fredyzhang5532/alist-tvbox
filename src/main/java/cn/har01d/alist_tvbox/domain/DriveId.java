@@ -1,0 +1,125 @@
+package cn.har01d.alist_tvbox.domain;
+
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public final class DriveId {
+    private static final Map<Integer, String> TYPE_TO_DRIVE = new LinkedHashMap<>();
+    private static final Map<String, Integer> DRIVE_TO_TYPE = new LinkedHashMap<>();
+    /** 盘 key → 展示名(TVBox 线路名/事件文案);未知 key 原样展示 */
+    private static final Map<String, String> DISPLAY_NAMES = Map.ofEntries(
+            Map.entry("baidu", "百度网盘"), Map.entry("quark", "夸克网盘"), Map.entry("ali", "阿里云盘"),
+            Map.entry("115", "115网盘"), Map.entry("uc", "UC网盘"), Map.entry("189", "天翼云盘"),
+            Map.entry("123", "123云盘"), Map.entry("139", "移动云盘"), Map.entry("thunder", "迅雷云盘"),
+            Map.entry("pikpak", "PikPak"), Map.entry("duck", "广雅网盘"), Map.entry("local", "本地"),
+            Map.entry("strm", "STRM"));
+
+    static {
+        register(0, "ali");
+        register(1, "pikpak");
+        register(2, "thunder");
+        register(3, "123");
+        register(4, "local");
+        register(5, "quark");
+        register(6, "139");
+        register(7, "uc");
+        register(8, "115");
+        register(9, "189");
+        register(10, "baidu");
+        register(11, "strm");
+        register(12, "duck");
+    }
+
+    private DriveId() {
+    }
+
+    public static Integer toTypeOrNull(String value) {
+        if (StringUtils.isBlank(value)) {
+            return null;
+        }
+        String normalized = StringUtils.lowerCase(value.trim());
+        Integer type = DRIVE_TO_TYPE.get(normalized);
+        if (type != null) {
+            return type;
+        }
+        try {
+            return Integer.parseInt(normalized);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Unknown drive identifier: " + value, e);
+        }
+    }
+
+    /** 宽松版:未知/不可解析标识返回 null(外部白名单映射用,坏值不炸搜索)。 */
+    public static Integer toTypeLeniently(String value) {
+        try {
+            return toTypeOrNull(value);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public static int toType(String value) {
+        Integer type = toTypeOrNull(value);
+        if (type == null) {
+            throw new IllegalArgumentException("Drive identifier is blank");
+        }
+        return type;
+    }
+
+    public static String toDrive(int type) {
+        return TYPE_TO_DRIVE.getOrDefault(type, String.valueOf(type));
+    }
+
+    public static String displayName(String drive) {
+        return drive == null ? null : DISPLAY_NAMES.getOrDefault(drive, drive);
+    }
+
+    public static String normalize(String value) {
+        return toDrive(toType(value));
+    }
+
+    /** 内嵌 AList 存储驱动名 → 盘类型(手动路径资源标注盘线路用);未知/套娃驱动返回 null(不单独出线路)。 */
+    private static final Map<String, Integer> DRIVER_TO_TYPE = Map.ofEntries(
+            Map.entry("Quark", 5), Map.entry("QuarkTV", 5),
+            Map.entry("UC", 7), Map.entry("UCTV", 7),
+            Map.entry("115 Cloud", 8), Map.entry("115 Open", 8),
+            Map.entry("BaiduNetdisk", 10),
+            Map.entry("189CloudPC", 9),
+            Map.entry("139Yun", 6),
+            Map.entry("123Pan", 3), Map.entry("123 Open", 3),
+            Map.entry("ThunderBrowser", 2),
+            Map.entry("AliyundriveOpen", 0), Map.entry("AliyunShare", 0),
+            Map.entry("PikPak", 1),
+            Map.entry("GuangYaPan", 12),
+            Map.entry("Local", 4),
+            Map.entry("Strm", 11));
+
+    /** 存储驱动名(x_storages.driver)→ 盘类型;空白/未收录(套娃 AList 等)返回 null。 */
+    public static Integer fromDriverName(String driver) {
+        return StringUtils.isBlank(driver) ? null : DRIVER_TO_TYPE.get(driver.trim());
+    }
+
+    public static boolean isShareTokenName(String value) {
+        if (StringUtils.isBlank(value)) {
+            return false;
+        }
+        String[] parts = value.split("@", 3);
+        if (parts.length < 2) {
+            return false;
+        }
+        try {
+            toType(parts[0]);
+            return true;
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private static void register(int type, String drive) {
+        TYPE_TO_DRIVE.put(type, drive);
+        DRIVE_TO_TYPE.put(drive, type);
+        DRIVE_TO_TYPE.put(String.valueOf(type), type);
+    }
+}

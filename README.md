@@ -36,7 +36,7 @@ Or run container from Docker hub.
 docker run -d -p 4567:4567 --restart=always --name=alist-tvbox haroldli/alist-tvbox
 ```
 ```bash
-docker run -d -p 4567:4567 -p 5344:80 -e ALIST_PORT=5344 -v /etc/xiaoya:/data --restart=always --name=xiaoya-tvbox haroldli/xiaoya-tvbox:latest
+docker run -d -p 4567:4567 -p 5344:80 -e ALIST_PORT=5344 -v /opt/alist-tvbox:/data --restart=always --name=xiaoya-tvbox haroldli/xiaoya-tvbox:latest
 ```
 username: admin
 
@@ -83,7 +83,21 @@ e.g.: disable 2 sites by key, change 1 site name by key, add new site.
   }
 }
 ```
-
+customize sites order by setting `order` field (lower value appears first). Built-in sources and plugins start from 1000, subscription sources start from 2000, sites without order default to 9000.
+```json
+{
+  "sites": [
+    {
+      "key": "豆瓣",
+      "order": 100
+    },
+    {
+      "key": "YouTube",
+      "order": 500
+    }
+  ]
+}
+```
 ### Python Spider Plugins
 Python spider plugins are loaded through `csp_PyProxy` from the bundled `spring.jar`. The original Python entry and ext are wrapped like this:
 ```json
@@ -98,3 +112,10 @@ Python spider plugins are loaded through `csp_PyProxy` from the bundled `spring.
 ```
 
 `loader`, `local_proxy_config`, and the rest of the Python-side config are all encoded into `ext`. If `local_proxy_config` remains `{}`, local proxy acceleration is not enabled.
+
+# Features
+- Web management UI for AList-TvBox.
+- TvBox subscriptions and aggregated configurations.
+- Multiple AList, Emby, Jellyfin, Feiniu, BiliBili, YouTube, and live-stream sources.
+- Cloud drive accounts and shares for Aliyun, Baidu, Quark, UC, 115, 123, Tianyi, 139, Thunder, PikPak, and GuangYa.
+- Python spider plugin management, plugin filters, local proxy acceleration, and offline download for 115, GuangYa, and Thunder.

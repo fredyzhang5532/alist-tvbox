@@ -1,15 +1,25 @@
 <template>
-  <div class="list">
-    <h1>阿里账号列表</h1>
-    <el-row justify="end">
-      <el-button @click="load">刷新</el-button>
-      <el-button type="primary" @click="handleAdd">添加</el-button>
-    </el-row>
-    <div class="space"></div>
+  <div class="page-container">
+    <div class="page-header">
+      <h1 class="page-title">阿里账号列表</h1>
+      <div class="page-actions">
+        <el-button @click="load">刷新</el-button>
+        <el-button type="primary" @click="handleAdd">添加</el-button>
+      </div>
+    </div>
 
-    <el-table :data="accounts" border style="width: 100%">
+    <div class="page-card">
+    <div class="table-scroll-wrapper">
+      <el-table :data="accounts" border style="width: 100%; min-width: 900px">
 <!--      <el-table-column prop="id" label="ID" sortable width="70"/>-->
       <el-table-column prop="nickname" label="昵称" sortable width="180"/>
+      <el-table-column label="归属" width="90">
+        <template #default="scope">
+          <el-tag :type="scope.row.ownerUid === 0 ? 'info' : 'success'" size="small">
+            {{ scope.row.ownerUid === 0 ? (store.admin ? '全局' : '共享') : '我的' }}
+          </el-tag>
+        </template>
+      </el-table-column>
       <el-table-column prop="autoCheckin" label="自动签到" width="90">
         <template #default="scope">
           <el-icon v-if="scope.row.autoCheckin">
@@ -54,24 +64,16 @@
           </el-icon>
         </template>
       </el-table-column>
-      <el-table-column prop="master" label="开启代理？" width="120">
+      <el-table-column fixed="right" label="操作" width="270">
         <template #default="scope">
-          <el-icon v-if="scope.row.useProxy">
-            <Check/>
-          </el-icon>
-          <el-icon v-else>
-            <Close/>
-          </el-icon>
-        </template>
-      </el-table-column>
-      <el-table-column prop="concurrency" label="线程数" width="110"/>
-      <el-table-column fixed="right" label="操作" width="200">
-        <template #default="scope">
+          <el-button link type="primary" size="small" @click="showAccountInfo(scope.row)">账号信息</el-button>
           <el-button link type="primary" size="small" @click="showDetails(scope.row)">详情</el-button>
-          <el-button link type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
+          <el-button v-if="canManage(scope.row)" link type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
+    </div>
+    </div>
 
     <el-dialog v-model="formVisible" :title="dialogTitle" width="60%">
       <el-form :model="form" label-width="auto">
@@ -110,20 +112,14 @@
           />
           <span class="hint">主账号用来观看分享。</span>
         </el-form-item>
-        <el-form-item label="加速代理">
+        <el-form-item label="共享给普通用户" v-if="store.admin && !form.ownerUid">
           <el-switch
-            v-model="form.useProxy"
+            v-model="form.shared"
             inline-prompt
             active-text="开启"
             inactive-text="关闭"
           />
-          <span class="hint">服务端多线程加速，网页播放强制开启</span>
-        </el-form-item>
-        <el-form-item label="代理线程数">
-          <el-input-number :min="1" :max="16" v-model="form.concurrency"/>
-        </el-form-item>
-        <el-form-item label="分片大小">
-          <el-input-number :min="64" :max="4096" v-model="form.chunkSize"/>
+          <span class="hint">允许普通用户经服务端代理使用该账号,凭证不会下发给普通用户</span>
         </el-form-item>
         <el-form-item label="自动签到">
           <el-switch
@@ -140,6 +136,20 @@
         <el-button type="primary" @click="handleConfirm">{{ updateAction ? '更新' : '添加' }}</el-button>
       </span>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="accountInfoVisible" title="阿里云盘账号信息" width="500px">
+      <el-descriptions v-if="accountInfo" :column="1" border>
+        <el-descriptions-item label="用户名">{{ accountInfo.name || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="用户 ID">{{ accountInfo.id || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="会员类型">{{ accountInfo.vip || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="会员过期时间">{{ formatAccountExpireAt(accountInfo.expireAt) }}</el-descriptions-item>
+        <el-descriptions-item label="已用容量">{{ formatCapacity(accountInfo.usedCapacity) }}</el-descriptions-item>
+        <el-descriptions-item label="总容量">{{ formatCapacity(accountInfo.totalCapacity) }}</el-descriptions-item>
+        <el-descriptions-item v-if="accountInfo.addition?.rightsName" label="会员权益">
+          {{ accountInfo.addition.rightsName }}
+        </el-descriptions-item>
+      </el-descriptions>
     </el-dialog>
 
     <el-dialog v-model="dialogVisible" title="删除阿里账号" width="30%">
@@ -199,6 +209,15 @@
           />
           <span class="hint">主账号用来观看分享。</span>
         </el-form-item>
+        <el-form-item label="共享给普通用户" v-if="store.admin && !form.ownerUid">
+          <el-switch
+            v-model="form.shared"
+            inline-prompt
+            active-text="开启"
+            inactive-text="关闭"
+          />
+          <span class="hint">允许普通用户经服务端代理使用该账号,凭证不会下发给普通用户</span>
+        </el-form-item>
         <el-form-item label="自动签到">
           <el-switch
             v-model="form.autoCheckin"
@@ -206,21 +225,6 @@
             active-text="开启"
             inactive-text="关闭"
           />
-        </el-form-item>
-        <el-form-item label="加速代理">
-          <el-switch
-            v-model="form.useProxy"
-            inline-prompt
-            active-text="开启"
-            inactive-text="关闭"
-          />
-          <span class="hint">服务端多线程加速，网页播放强制开启</span>
-        </el-form-item>
-        <el-form-item label="代理线程数">
-          <el-input-number :min="1" :max="16" v-model="form.concurrency"/>
-        </el-form-item>
-        <el-form-item label="分片大小">
-          <el-input-number :min="64" :max="4096" v-model="form.chunkSize"/>
         </el-form-item>
         <el-form-item label="上次签到时间" v-if="form.checkinTime">
           <el-input :model-value="formatTime(form.checkinTime)" readonly/>
@@ -279,13 +283,16 @@
       </template>
     </el-dialog>
 
-    <div class="divider"></div>
+    <div class="page-header" style="margin-top: 24px;">
+      <h1 class="page-title">网盘账号列表</h1>
+    </div>
+    <driver-account-view embedded></driver-account-view>
 
-    <PikPakView></PikPakView>
+    <div class="page-header" style="margin-top: 24px;">
+      <h1 class="page-title">PikPak账号列表</h1>
+    </div>
+    <PikPakView embedded></PikPakView>
 
-    <div class="divider"></div>
-
-    <driver-account-view></driver-account-view>
   </div>
 </template>
 
@@ -299,9 +306,22 @@ import router from "@/router";
 import PikPakView from '@/views/PikPakView.vue'
 import DriverAccountView from "@/views/DriverAccountView.vue";
 
+// 多用户归属:全局账号(ownerUid=0)仅管理员可管理;普通用户只能管理自己的账号(后端 AccountAccessGuard 兜底)
+const canManage = (row: any) => store.admin || row.ownerUid !== 0
+
 const iat = ref([0])
 const exp = ref([0])
 const activities = ref<any[]>([])
+type AliAccountInfo = {
+  id?: string
+  name?: string
+  vip?: string
+  usedCapacity?: number
+  totalCapacity?: number
+  expireAt?: number | null
+  addition?: Record<string, string>
+}
+
 const forceCheckin = ref(false)
 const updateAction = ref(false)
 const dialogTitle = ref('')
@@ -310,7 +330,9 @@ const code = ref('')
 const tokenUrl = ref('')
 const base64QrCode = ref('')
 const accounts = ref([])
+const accountInfo = ref<AliAccountInfo | null>(null)
 const formVisible = ref(false)
+const accountInfoVisible = ref(false)
 const dialogVisible = ref(false)
 const qrVisible = ref(false)
 const detailVisible = ref(false)
@@ -319,6 +341,8 @@ const timelineVisible = ref(false)
 const form = ref({
   id: 0,
   nickname: '',
+  shared: true,
+  ownerUid: 0,
   refreshToken: '',
   openToken: '',
   accessToken: '',
@@ -339,6 +363,38 @@ const form = ref({
 
 const formatTime = (value: string | number) => {
   return new Date(value).toLocaleString('zh-cn')
+}
+
+const formatCapacity = (bytes?: number) => {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) {
+    return '—'
+  }
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex++
+  }
+  return `${value.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`
+}
+
+const formatAccountExpireAt = (expireAt?: number | null) => {
+  if (!expireAt) {
+    return '—'
+  }
+  const timestamp = expireAt < 100000000000 ? expireAt * 1000 : expireAt
+  return formatTime(timestamp)
+}
+
+const showAccountInfo = (account: any) => {
+  accountInfo.value = null
+  axios.post('/api/ali/accounts/-/info', account).then(({data}) => {
+    accountInfo.value = data
+    accountInfoVisible.value = true
+  }).catch((error) => {
+    ElMessage.error(error?.response?.data?.message || '获取账号信息失败')
+  })
 }
 
 const showDetails = (data: any) => {
@@ -396,6 +452,8 @@ const handleAdd = () => {
   form.value = {
     id: 0,
     nickname: '',
+    shared: true,
+    ownerUid: 0,
     refreshToken: '',
     openToken: '',
     accessToken: '',

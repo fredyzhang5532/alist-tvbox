@@ -9,7 +9,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -22,6 +22,7 @@ import org.springframework.web.client.RestTemplate;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -36,6 +37,7 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
     private static final String FILE_LIST_URL = "https://webapi.115.com/files?aid=1&cid=%s&offset=0&limit=20&type=0&show_dir=1&fc_mix=0&natsort=1&count_folders=1&format=json&custom_order=0";
     private static final String FILE_ADD_URL = "https://webapi.115.com/files/add";
     private static final Pattern UID_PATTERN = Pattern.compile("UID=(\\d+)");
+    private static final Pattern INFO_HASH_PATTERN = Pattern.compile("xt=urn:btih:([A-Za-z0-9]+)", Pattern.CASE_INSENSITIVE);
 
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
@@ -78,6 +80,11 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
 
     @Override
     public TaskResult submitAndWait(DriverAccount account, String url, String folderId) {
+        return submitAndWait(account, url, folderId, 10);
+    }
+
+    @Override
+    public TaskResult submitAndWait(DriverAccount account, String url, String folderId, int waitSeconds) {
         String cookie = requireCookie(account);
         String uid = extractUid(cookie);
 
@@ -108,7 +115,7 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
             throw new BadRequestException("task failed: " + message);
         }
 
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < Math.max(1, waitSeconds); i++) {
             ObjectNode task = findTask(url, cookie, duplicateTask ? 2 : 1);
             if (task == null) {
                 sleepOneSecond();
@@ -134,7 +141,7 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
             sleepOneSecond();
         }
 
-        throw new BadRequestException("离线下载任务未在10秒内完成");
+        throw new BadRequestException("离线下载任务未在" + Math.max(1, waitSeconds) + "秒内完成");
     }
 
     @Override
@@ -243,16 +250,35 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
         return null;
     }
 
-    private ObjectNode findTaskInPage(ObjectNode taskList, String url) {
+    static ObjectNode findTaskInPage(ObjectNode taskList, String url) {
         if (!taskList.has("tasks") || !taskList.get("tasks").isArray()) {
             return null;
         }
+        String infoHash = extractInfoHash(url);
         for (var item : taskList.get("tasks")) {
+            String taskHash = item.path("info_hash").asText("");
+            if (StringUtils.isNotBlank(infoHash)
+                    && StringUtils.isNotBlank(taskHash)
+                    && taskHash.equalsIgnoreCase(infoHash)) {
+                return (ObjectNode) item;
+            }
             if (Objects.equals(item.path("url").asText(""), url)) {
                 return (ObjectNode) item;
             }
         }
         return null;
+    }
+
+    static String extractInfoHash(String url) {
+        if (StringUtils.isBlank(url)) {
+            return "";
+        }
+        Matcher matcher = INFO_HASH_PATTERN.matcher(url);
+        if (!matcher.find()) {
+            return "";
+        }
+        String raw = matcher.group(1);
+        return raw.matches("[0-9A-Fa-f]{40}") ? raw.toLowerCase(Locale.ROOT) : "";
     }
 
     private String taskListUrl(int page) {

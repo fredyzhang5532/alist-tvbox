@@ -1,0 +1,298 @@
+package cn.har01d.alist_tvbox.service;
+
+import cn.har01d.alist_tvbox.entity.Plugin;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class SubscriptionServiceTest {
+
+    // ---- helpers ----
+    private Map<String, Object> site(String key) {
+        Map<String, Object> s = new HashMap<>();
+        s.put("key", key);
+        s.put("name", key);
+        return s;
+    }
+
+    private Map<String, Object> parse(String name) {
+        Map<String, Object> p = new HashMap<>();
+        p.put("name", name);
+        return p;
+    }
+
+    private Map<String, Object> config(String... siteKeys) {
+        List<Map<String, Object>> sites = new ArrayList<>();
+        for (String k : siteKeys) sites.add(site(k));
+        Map<String, Object> c = new HashMap<>();
+        c.put("sites", sites);
+        return c;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> siteKeys(Map<String, Object> c) {
+        List<String> keys = new ArrayList<>();
+        for (Map<String, Object> s : (List<Map<String, Object>>) c.get("sites")) keys.add((String) s.get("key"));
+        return keys;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> parseNames(Map<String, Object> c) {
+        List<String> names = new ArrayList<>();
+        Object obj = c.get("parses");
+        if (obj instanceof List) for (Map<String, Object> p : (List<Map<String, Object>>) obj) names.add((String) p.get("name"));
+        return names;
+    }
+
+    private Map<String, Object> whitelist(String... keys) {
+        return new HashMap<>(Map.of("sites-whitelist", new ArrayList<>(List.of(keys))));
+    }
+
+    private Map<String, Object> blacklistSites(String... keys) {
+        Map<String, Object> bl = new HashMap<>();
+        bl.put("sites", new ArrayList<>(List.of(keys)));
+        return new HashMap<>(Map.of("blacklist", bl));
+    }
+
+    // ---- truth table ----
+
+    @Test
+    void subscriptionWhitelistWinsAndIgnoresEverything() {
+        Map<String, Object> c = config("A", "B", "C");
+        SubscriptionService.resolveAndApplyFilters(c, blacklistSites("A"), whitelist("A"));
+        assertThat(siteKeys(c)).containsExactly("A");
+        assertThat(c).doesNotContainKeys("sites-whitelist", "sites-blacklist", "blacklist");
+    }
+
+    @Test
+    void subscriptionBlacklistReplacesGlobal() {
+        Map<String, Object> c = config("A", "B", "C");
+        SubscriptionService.resolveAndApplyFilters(c, blacklistSites("A"), blacklistSites("B"));
+        assertThat(siteKeys(c)).containsExactlyInAnyOrder("A", "C"); // global A ignored, sub removes B
+    }
+
+    @Test
+    void globalWhitelistUsedWhenNoSubscriptionFilter() {
+        Map<String, Object> c = config("A", "B", "C");
+        SubscriptionService.resolveAndApplyFilters(c, whitelist("A", "B"), new HashMap<>());
+        assertThat(siteKeys(c)).containsExactlyInAnyOrder("A", "B");
+    }
+
+    @Test
+    void globalBlacklistUsedWhenNoSubscriptionFilter() {
+        Map<String, Object> c = config("A", "B", "C");
+        SubscriptionService.resolveAndApplyFilters(c, blacklistSites("B"), new HashMap<>());
+        assertThat(siteKeys(c)).containsExactlyInAnyOrder("A", "C");
+    }
+
+    @Test
+    void subscriptionWhitelistBeatsSubscriptionBlacklist() {
+        Map<String, Object> c = config("A", "B");
+        Map<String, Object> override = whitelist("A");
+        override.putAll(blacklistSites("A")); // both whitelist + blacklist present
+        SubscriptionService.resolveAndApplyFilters(c, new HashMap<>(), override);
+        assertThat(siteKeys(c)).containsExactly("A");
+    }
+
+    @Test
+    void emptyFiltersStillRemoveAlist1() {
+        Map<String, Object> c = config("A", "Alist1", "B");
+        SubscriptionService.resolveAndApplyFilters(c, new HashMap<>(), new HashMap<>());
+        assertThat(siteKeys(c)).containsExactlyInAnyOrder("A", "B");
+    }
+
+    @Test
+    void legacyTopLevelSitesBlacklistIsHonored() {
+        Map<String, Object> c = config("A", "B");
+        Map<String, Object> override = new HashMap<>();
+        override.put("sites-blacklist", new ArrayList<>(List.of("B")));
+        SubscriptionService.resolveAndApplyFilters(c, new HashMap<>(), override);
+        assertThat(siteKeys(c)).containsExactly("A");
+    }
+
+    @Test
+    void blacklistParsesRemovedByName() {
+        Map<String, Object> c = config("A");
+        c.put("parses", new ArrayList<>(List.of(parse("虾米"), parse("Json"))));
+        Map<String, Object> bl = new HashMap<>();
+        bl.put("parses", new ArrayList<>(List.of("虾米")));
+        SubscriptionService.resolveAndApplyFilters(c, new HashMap<>(), new HashMap<>(Map.of("blacklist", bl)));
+        assertThat(parseNames(c)).containsExactly("Json");
+    }
+
+    @Test
+    void whitelistModeIgnoresParseBlacklist() {
+        Map<String, Object> c = config("A", "B");
+        c.put("parses", new ArrayList<>(List.of(parse("虾米"))));
+        Map<String, Object> override = whitelist("A");
+        Map<String, Object> bl = new HashMap<>();
+        bl.put("parses", new ArrayList<>(List.of("虾米")));
+        override.put("blacklist", bl);
+        SubscriptionService.resolveAndApplyFilters(c, new HashMap<>(), override);
+        assertThat(siteKeys(c)).containsExactly("A");
+        assertThat(parseNames(c)).containsExactly("虾米"); // parse NOT removed in whitelist mode
+    }
+
+    @Test
+    void buildCatalogTagsUpstreamBuiltinPluginAndMapsPushKey() {
+        // atv_home 为上游手写条目:被内置定义合并,目录里只以 builtin 形态出现一次(不以 upstream 形态重复)
+        Map<String, Object> c = config("csp_Bili", "atv_home"); // upstream
+        c.put("parses", new ArrayList<>(List.of(parse("虾米"))));
+
+        Plugin plugin = new Plugin();
+        plugin.setId(1);
+        plugin.setName("我的插件");
+        plugin.setExternalId("stable-plugin-id");
+
+        List<SubscriptionSourceService.SubscriptionSourceRef> sources = List.of(
+                new SubscriptionSourceService.SubscriptionSourceRef("builtin-atv_home", true, "atv_home", "影视首页", null),
+                new SubscriptionSourceService.SubscriptionSourceRef("builtin-csp_AList", true, "csp_AList", "🟢 AList", null),
+                new SubscriptionSourceService.SubscriptionSourceRef("builtin-csp_Push", true, "csp_Push", "推送", null),
+                new SubscriptionSourceService.SubscriptionSourceRef("plugin-1", false, "我的插件", "我的插件", plugin)
+        );
+
+        Map<String, Object> catalog = SubscriptionService.buildCatalog(c, sources);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> sites = (List<Map<String, Object>>) catalog.get("sites");
+        // WebHome 首页站随目录返回(白名单模式须可选),上游手写条目被去重,只出现一次且为 builtin
+        assertThat(sites).filteredOn(s -> "atv_home".equals(s.get("key"))).hasSize(1);
+        assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "atv_home")
+                .containsEntry("name", "影视首页").containsEntry("origin", "builtin"));
+        assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "csp_Bili").containsEntry("origin", "upstream"));
+        assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "csp_AList").containsEntry("origin", "builtin"));
+        assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "push_agent").containsEntry("origin", "builtin"));
+        assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "stable-plugin-id")
+                .containsEntry("name", "我的插件").containsEntry("origin", "plugin"));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> parses = (List<Map<String, Object>>) catalog.get("parses");
+        assertThat(parses).extracting(p -> p.get("name")).containsExactly("虾米");
+    }
+
+    @Test
+    void webPageSiteKeyDerivesFromFileName() {
+        // 自定义网页源站点目录 key 与下发站点一致(web_ 前缀,特殊字符折叠,纯中文回落插件 id)
+        Plugin page = new Plugin();
+        page.setId(12);
+        page.setUrl("/static/webhome/pages/movie-4K.html");
+        assertThat(SubscriptionService.pluginSiteKey(page)).isEqualTo("web_movie_4K");
+
+        Plugin chinese = new Plugin();
+        chinese.setId(34);
+        chinese.setUrl("/static/webhome/pages/电影库.html");
+        assertThat(SubscriptionService.pluginSiteKey(chinese)).isEqualTo("web_34");
+
+        Plugin normal = new Plugin();
+        normal.setId(56);
+        assertThat(SubscriptionService.pluginSiteKey(normal)).isEqualTo("plugin-56");
+    }
+
+    @Test
+    void pluginSiteKeyDoesNotChangeWhenDisplayNameChanges() {
+        Plugin plugin = new Plugin();
+        plugin.setId(7);
+        plugin.setExternalId("02544b320a6d45de997bc0bd3975d0c060b8");
+        plugin.setName("木偶[盘]");
+
+        assertThat(SubscriptionService.pluginSiteKey(plugin))
+                .isEqualTo("02544b320a6d45de997bc0bd3975d0c060b8");
+
+        plugin.setName("重命名后的木偶");
+        assertThat(SubscriptionService.pluginSiteKey(plugin))
+                .isEqualTo("02544b320a6d45de997bc0bd3975d0c060b8");
+    }
+
+    @Test
+    void rawPythonPluginShouldUsePyProxyLoaderAndLocalProxyInEveryRunMode() {
+        Plugin plugin = new Plugin();
+        plugin.setId(7);
+        plugin.setExternalId("stable-plugin-id");
+        plugin.setName("短剧优选");
+        plugin.setUrl("https://example.com/demo.py?raw=1");
+        plugin.setExtend("{\"site\":\"demo\"}");
+        Map<String, Object> localProxyConfig = new HashMap<>();
+        localProxyConfig.put("ALI", Map.of("enabled", true));
+
+        Map<String, Object> payload = SubscriptionService.buildPluginExtPayload(
+                plugin, "http://atv", "web", "vod-token", "secret", true, localProxyConfig);
+
+        assertThat(SubscriptionService.selectPluginApi(plugin, true, "http://atv"))
+                .isEqualTo("csp_PyProxy");
+        assertThat(SubscriptionService.selectPluginApi(plugin, false, "http://atv"))
+                .isEqualTo("csp_PyProxy");
+        assertThat(payload)
+                .containsEntry("loader", "http://atv/Atvp.py?v=preheat-v1")
+                .containsEntry("source", "http://atv/plugins/web/7.py")
+                .containsEntry("raw", true)
+                .containsEntry("api", "http://atv")
+                .containsEntry("preheatUrl", "http://atv/plugin-preheat/web")
+                .containsEntry("playbackSourceKind", "spider_plugin")
+                .containsEntry("playbackSourceKey", "stable-plugin-id")
+                .containsEntry("playbackSourceName", "短剧优选")
+                .containsEntry("token", "vod-token")
+                .containsEntry("secret", "secret")
+                .containsEntry("data", "{\"site\":\"demo\"}")
+                .containsEntry("local_proxy_config", localProxyConfig);
+        assertThat(payload.get("loader")).isNotEqualTo("http://atv/plugins/web/7.py");
+
+        // 有版本号时 source 地址带版本参数:预下载缓存以完整地址为 key,插件更新换地址即失效
+        plugin.setVersion(12);
+        assertThat(SubscriptionService.pluginContentUrl("http://atv", "web", plugin))
+                .isEqualTo("http://atv/plugins/web/7.py?v=12");
+        plugin.setVersion(null);
+        assertThat(SubscriptionService.pluginContentUrl("http://atv", "web", plugin))
+                .isEqualTo("http://atv/plugins/web/7.py");
+    }
+
+    @Test
+    void encryptedTxtPluginShouldKeepSourceAndNativePythonModeBehavior() {
+        Plugin plugin = new Plugin();
+        plugin.setId(8);
+        plugin.setUrl("https://example.com/demo.txt");
+        Map<String, Object> localProxyConfig = new HashMap<>();
+        localProxyConfig.put("ALI", Map.of("enabled", true));
+
+        Map<String, Object> payload = SubscriptionService.buildPluginExtPayload(
+                plugin, "http://atv", "web", "", "secret", true, localProxyConfig);
+
+        assertThat(SubscriptionService.selectPluginApi(plugin, true, "http://atv"))
+                .isEqualTo("http://atv/Atvp.py?v=preheat-v1");
+        assertThat(SubscriptionService.selectPluginApi(plugin, false, "http://atv"))
+                .isEqualTo("csp_PyProxy");
+        assertThat(payload)
+                .containsEntry("source", "http://atv/plugins/web/8.txt")
+                .containsEntry("token", "-")
+                .doesNotContainKey("loader")
+                // Python 原生模式同样下发代理配置:Atvp.py 依此声明 client-proxy 并经本地 /player 改写播放地址
+                .containsEntry("local_proxy_config", localProxyConfig);
+
+        Map<String, Object> javaPayload = SubscriptionService.buildPluginExtPayload(
+                plugin, "http://atv", "web", "", "secret", false, localProxyConfig);
+        assertThat(javaPayload)
+                .containsEntry("loader", "http://atv/Atvp.py?v=preheat-v1")
+                .containsEntry("local_proxy_config", localProxyConfig);
+    }
+
+    @Test
+    void pianDanBuiltinAlwaysKeepsIndexNavigationCapabilities() {
+        Map<String, Object> site = new HashMap<>();
+        site.put("indexs", 0);
+        site.put("searchable", 1);
+        site.put("quickSearch", 1);
+        site.put("filterable", 0);
+
+        SubscriptionService.applyBuiltinSiteCapabilities("csp_PianDan", true, site);
+
+        assertThat(site)
+                .containsEntry("indexs", 1)
+                .containsEntry("searchable", 0)
+                .containsEntry("quickSearch", 0)
+                .containsEntry("filterable", 1);
+    }
+}
